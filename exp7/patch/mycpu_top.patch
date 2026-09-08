@@ -1,0 +1,211 @@
+diff --git a/mycpu_top.v b/mycpu_top.v
+index 445e91f..81c8d3c 100644
+--- a/mycpu_top.v
++++ b/mycpu_top.v
+@@ -2,12 +2,14 @@ module mycpu_top(
+     input  wire        clk,
+     input  wire        resetn,
+     // inst sram interface
+-    output wire        inst_sram_we,
++    output wire        inst_sram_en,
++    output wire [ 3:0] inst_sram_we,
+     output wire [31:0] inst_sram_addr,
+     output wire [31:0] inst_sram_wdata,
+     input  wire [31:0] inst_sram_rdata,
+     // data sram interface
+-    output wire        data_sram_we,
++    output wire        data_sram_en,
++    output wire [ 3:0] data_sram_we,
+     output wire [31:0] data_sram_addr,
+     output wire [31:0] data_sram_wdata,
+     input  wire [31:0] data_sram_rdata,
+@@ -52,6 +54,7 @@ wire [31:0] rkd_value;
+ wire [31:0] imm;
+ wire [31:0] br_offs;
+ wire [31:0] jirl_offs;
++wire        rj_eq_rd;
+ 
+ wire [ 5:0] op_31_26;
+ wire [ 3:0] op_25_22;
+@@ -117,22 +120,47 @@ wire [31:0] mem_result;
+  */
+ wire [31:0] final_result;
+ 
++reg         if_id_valid;
++reg  [31:0] if_id_pc;
++reg  [31:0] if_id_inst;
++
++reg         id_ex_valid;
++reg  [31:0] id_ex_pc;
++reg  [31:0] id_ex_rj_value;
++reg  [31:0] id_ex_rkd_value;
++reg  [31:0] id_ex_imm;
++reg  [11:0] id_ex_alu_op;
++reg         id_ex_src1_is_pc;
++reg         id_ex_src2_is_imm;
++reg         id_ex_res_from_mem;
++reg         id_ex_mem_we;
++reg         id_ex_gr_we;
++reg  [ 4:0] id_ex_dest;
++
++reg         ex_mem_valid;
++reg  [31:0] ex_mem_pc;
++reg  [31:0] ex_mem_alu_result;
++reg  [31:0] ex_mem_store_data;
++reg         ex_mem_res_from_mem;
++reg         ex_mem_mem_we;
++reg         ex_mem_gr_we;
++reg  [ 4:0] ex_mem_dest;
++
++reg         mem_wb_valid;
++reg  [31:0] mem_wb_pc;
++reg  [31:0] mem_wb_alu_result;
++reg         mem_wb_res_from_mem;
++reg         mem_wb_gr_we;
++reg  [ 4:0] mem_wb_dest;
++
+ assign seq_pc       = pc + 3'h4;
+ assign nextpc       = br_taken ? br_target : seq_pc;
+ 
+-always @(posedge clk) begin
+-    if (reset) begin
+-        pc <= 32'h1bfffffc;     //trick: to make nextpc be 0x1c000000 during reset 
+-    end
+-    else begin
+-        pc <= nextpc;
+-    end
+-end
+-
+-assign inst_sram_we    = 1'b0;
+-assign inst_sram_addr  = pc;
++assign inst_sram_en    = 1'b1;
++assign inst_sram_we    = 4'b0;
++assign inst_sram_addr  = nextpc;
+ assign inst_sram_wdata = 32'b0;
+-assign inst            = inst_sram_rdata;
++assign inst            = if_id_inst;
+ 
+ assign op_31_26  = inst[31:26];
+ assign op_25_22  = inst[25:22];
+@@ -249,41 +277,105 @@ assign br_taken = (   inst_beq  &&  rj_eq_rd
+                    || inst_jirl
+                    || inst_bl
+                    || inst_b
+-                  ) && valid;
+-assign br_target = (inst_beq || inst_bne || inst_bl || inst_b) ? (pc + br_offs) :
++                  ) && if_id_valid;
++assign br_target = (inst_beq || inst_bne || inst_bl || inst_b) ? (if_id_pc + br_offs) :
+                                                    /*inst_jirl*/ (rj_value + jirl_offs);
+ 
+-assign alu_src1 = src1_is_pc  ? pc[31:0] : rj_value;
+-assign alu_src2 = src2_is_imm ? imm : rkd_value;
++assign alu_src1 = id_ex_src1_is_pc  ? id_ex_pc       : id_ex_rj_value;
++assign alu_src2 = id_ex_src2_is_imm ? id_ex_imm      : id_ex_rkd_value;
+ 
+ /* answer
+  * bug：alu_src1连接错误
+  */
+ alu u_alu(
+-    .alu_op     (alu_op    ),
+-    .alu_src1   (alu_src1  ),
+-    .alu_src2   (alu_src2  ),
+-    .alu_result (alu_result)
++    .alu_op     (id_ex_alu_op),
++    .alu_src1   (alu_src1    ),
++    .alu_src2   (alu_src2    ),
++    .alu_result (alu_result  )
+     );
+ 
+-assign data_sram_we    = mem_we && valid;
+-assign data_sram_addr  = alu_result;
+-assign data_sram_wdata = rkd_value;
++assign data_sram_en    = 1'b1;
++assign data_sram_we    = {4{ex_mem_mem_we && ex_mem_valid}};
++assign data_sram_addr  = ex_mem_alu_result;
++assign data_sram_wdata = ex_mem_store_data;
+ 
+ assign mem_result   = data_sram_rdata;
+-assign final_result = res_from_mem ? mem_result : alu_result;
++assign final_result = mem_wb_res_from_mem ? mem_result : mem_wb_alu_result;
+ 
+-assign rf_we    = gr_we && valid;
+-assign rf_waddr = dest;
++assign rf_we    = mem_wb_gr_we && mem_wb_valid;
++assign rf_waddr = mem_wb_dest;
+ assign rf_wdata = final_result;
+ 
+ // debug info generate
+ /* answer
+  * bug：debug_wb_rf_we拼写错误
+  */
+-assign debug_wb_pc       = pc;
++assign debug_wb_pc       = mem_wb_pc;
+ assign debug_wb_rf_we    = {4{rf_we}};
+-assign debug_wb_rf_wnum  = dest;
++assign debug_wb_rf_wnum  = rf_waddr;
+ assign debug_wb_rf_wdata = final_result;
+ 
++always @(posedge clk) begin
++    if (reset) begin
++        pc          <= 32'h1bfffffc;
++        if_id_valid <= 1'b0;
++    end
++    else begin
++        pc          <= nextpc;
++        if_id_valid <= valid && !br_taken;
++        if_id_pc    <= pc;
++        if_id_inst  <= inst_sram_rdata;
++    end
++end
++
++always @(posedge clk) begin
++    if (reset) begin
++        id_ex_valid        <= 1'b0;
++    end
++    else begin
++        id_ex_valid        <= if_id_valid;
++        id_ex_pc           <= if_id_pc;
++        id_ex_rj_value     <= rj_value;
++        id_ex_rkd_value    <= rkd_value;
++        id_ex_imm          <= imm;
++        id_ex_alu_op       <= alu_op;
++        id_ex_src1_is_pc   <= src1_is_pc;
++        id_ex_src2_is_imm  <= src2_is_imm;
++        id_ex_res_from_mem <= res_from_mem;
++        id_ex_mem_we       <= mem_we;
++        id_ex_gr_we        <= gr_we;
++        id_ex_dest         <= dest;
++    end
++end
++
++always @(posedge clk) begin
++    if (reset) begin
++        ex_mem_valid        <= 1'b0;
++    end
++    else begin
++        ex_mem_valid        <= id_ex_valid;
++        ex_mem_pc           <= id_ex_pc;
++        ex_mem_alu_result   <= alu_result;
++        ex_mem_store_data   <= id_ex_rkd_value;
++        ex_mem_res_from_mem <= id_ex_res_from_mem;
++        ex_mem_mem_we       <= id_ex_mem_we;
++        ex_mem_gr_we        <= id_ex_gr_we;
++        ex_mem_dest         <= id_ex_dest;
++    end
++end
++
++always @(posedge clk) begin
++    if (reset) begin
++        mem_wb_valid        <= 1'b0;
++    end
++    else begin
++        mem_wb_valid        <= ex_mem_valid;
++        mem_wb_pc           <= ex_mem_pc;
++        mem_wb_alu_result   <= ex_mem_alu_result;
++        mem_wb_res_from_mem <= ex_mem_res_from_mem;
++        mem_wb_gr_we        <= ex_mem_gr_we;
++        mem_wb_dest         <= ex_mem_dest;
++    end
++end
++
+ endmodule
