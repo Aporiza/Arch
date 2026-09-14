@@ -1,0 +1,326 @@
+diff --git a/exp7/myCPU/ex_stage.v b/exp8/exp8/myCPU/ex_stage.v
+index 982e64b..eba0a21 100644
+--- a/exp7/myCPU/ex_stage.v
++++ b/exp8/exp8/myCPU/ex_stage.v
+@@ -4,6 +4,7 @@ module ex_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
++    input  wire         allow_in,
+ 
+     // 来自 ID/EX 的操作数与控制信号
+     input  wire         id_ex_valid,
+@@ -19,6 +20,11 @@ module ex_stage (
+     input  wire         id_ex_gr_we,
+     input  wire [4:0]   id_ex_dest,
+ 
++    // 当前 EX 指令的写回意图，反馈给 ID；不前递运算结果。
++    output wire         ex_pending_we,
++    output wire [4:0]   ex_pending_dest,
++    output wire         ready_go,
++
+     // EX/MEM 寄存器输出，供 MEM 阶段使用
+     output reg          ex_mem_valid,
+     output reg  [31:0]  ex_mem_pc,
+@@ -29,9 +35,12 @@ module ex_stage (
+     output reg          ex_mem_gr_we,
+     output reg  [4:0]   ex_mem_dest
+ );
++assign ready_go = 1'b1;
+ 
+ // ALU 操作数选择：PC 或寄存器值，立即数或第二个寄存器值
+ wire [31:0]  alu_result;
++assign ex_pending_we   = resetn && id_ex_valid && id_ex_gr_we && (id_ex_dest != 5'd0);
++assign ex_pending_dest = id_ex_dest;
+ wire [31:0]  alu_src1 = id_ex_src1_is_pc ? id_ex_pc : id_ex_rj_value;
+ wire [31:0]  alu_src2 = id_ex_src2_is_imm ? id_ex_imm : id_ex_rkd_value;
+ 
+diff --git a/exp7/myCPU/id_stage.v b/exp8/exp8/myCPU/id_stage.v
+index 19c387d..03f4b7b 100644
+--- a/exp7/myCPU/id_stage.v
++++ b/exp8/exp8/myCPU/id_stage.v
+@@ -1,9 +1,11 @@
++
+ // ID：指令译码、寄存器堆读写、立即数生成和分支判断。
+ // 译码结果和操作数在时钟上升沿一起进入 ID/EX 流水寄存器。
+ module id_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
++    input  wire         allow_in,
+ 
+     // 来自 IF/ID 的指令与 PC
+     input  wire         if_id_valid,
+@@ -15,6 +17,14 @@ module id_stage (
+     input  wire [4:0]   rf_waddr,
+     input  wire [31:0]  rf_wdata,
+ 
++    // EX/MEM 中尚未写回的目的寄存器，用于 RAW 相关检测。
++    input  wire         ex_pending_we,
++    input  wire [4:0]   ex_pending_dest,
++    input  wire         mem_pending_we,
++    input  wire [4:0]   mem_pending_dest,
++    // 本阶段可以继续推进时为 1；检测到数据相关时为 0
++    output wire         ready_go,
++
+     // 反馈给 IF 的分支结果（组合逻辑）
+     output wire         br_taken,
+     output wire [31:0]  br_target,
+@@ -144,6 +154,28 @@ wire [31:0]  rj_value,
+              rkd_value;
+ wire         rj_eq_rd = (rj_value == rkd_value);
+ 
++// 只检查指令真正读取的源寄存器，避免把立即数字段误判成寄存器。
++wire use_rj = inst_add_w | inst_sub_w | inst_slt | inst_sltu |
++              inst_nor | inst_and | inst_or | inst_xor |
++              inst_slli_w | inst_srli_w | inst_srai_w | inst_addi_w |
++              inst_ld_w | inst_st_w | inst_jirl | inst_beq | inst_bne;
++wire use_rkd = inst_add_w | inst_sub_w | inst_slt | inst_sltu |
++               inst_nor | inst_and | inst_or | inst_xor |
++               inst_st_w | inst_beq | inst_bne;
++
++// exp8 使用阻塞法：EX、MEM、WB 任一级将写入源寄存器，就等待。
++// WB 写寄存器也在上升沿完成，故该拍仍暂停，下一拍再读取更新后的值。
++// r0 恒为零，不构成数据相关。st.w 的存储数据和分支操作数也必须检查。
++wire hazard_rj = use_rj && (rj != 5'd0) &&
++                 ((ex_pending_we  && ex_pending_dest  == rj) ||
++                  (mem_pending_we && mem_pending_dest == rj) ||
++                  (rf_we          && rf_waddr         == rj));
++wire hazard_rkd = use_rkd && (rf_raddr2 != 5'd0) &&
++                  ((ex_pending_we  && ex_pending_dest  == rf_raddr2) ||
++                   (mem_pending_we && mem_pending_dest == rf_raddr2) ||
++                   (rf_we          && rf_waddr         == rf_raddr2));
++assign ready_go = !(resetn && if_id_valid && (hazard_rj || hazard_rkd));
++
+ // 寄存器堆：ID 提供读地址，WB 提供写使能、目的寄存器号和写回数据
+ regfile u_rf (
+     .clk    (clk),
+@@ -159,7 +191,7 @@ regfile u_rf (
+ // 只有有效指令才能发起跳转；beq/bne 比较寄存器值，b/bl/jirl 无条件跳转
+ assign br_taken = ((inst_beq & rj_eq_rd) |
+                    (inst_bne & ~rj_eq_rd) |
+-                   inst_jirl | inst_bl | inst_b) & if_id_valid;
++                   inst_jirl | inst_bl | inst_b) & if_id_valid & ready_go & resetn;
+ assign br_target = (inst_beq | inst_bne | inst_bl | inst_b)
+                  ? if_id_pc + br_offs
+                  : rj_value + jirl_offs;
+@@ -168,6 +200,9 @@ assign br_target = (inst_beq | inst_bne | inst_bl | inst_b)
+ always @(posedge clk) begin
+     if (reset)
+         id_ex_valid <= 1'b0;
++    else if (!ready_go)
++        // 前端保持当前指令，后端继续前进；向 EX 注入一个无效槽。
++        id_ex_valid <= 1'b0;
+     else begin
+         id_ex_valid        <= if_id_valid;
+         id_ex_pc           <= if_id_pc;
+diff --git a/exp7/myCPU/if_stage.v b/exp8/exp8/myCPU/if_stage.v
+index c0b3b77..b5b8145 100644
+--- a/exp7/myCPU/if_stage.v
++++ b/exp8/exp8/myCPU/if_stage.v
+@@ -8,6 +8,9 @@ module if_stage (
+     // 来自 ID 的取指重定向：是否跳转、目标地址
+     input  wire         redirect_i,
+     input  wire [31:0]  redirect_pc_i,
++    // 上一级允许本阶段接收新指令；为 0 时保持 PC 和 IF/ID
++    input  wire         allow_in,
++    output wire         ready_go,
+ 
+     // 指令 SRAM 接口
+     input  wire [31:0]  inst_sram_rdata,
+@@ -21,6 +24,7 @@ module if_stage (
+     output reg  [31:0]  if_id_pc,
+     output reg  [31:0]  if_id_inst
+ );
++assign ready_go = 1'b1;
+ 
+ // PC 状态与取指启动有效位
+ reg  [31:0]  pc;
+@@ -31,7 +35,8 @@ wire         reset = ~resetn;
+ wire [31:0]  next_pc = redirect_i ? redirect_pc_i : pc + 32'd4;
+ 
+ // 同步指令 RAM 使用 next_pc 发起读取；IF/ID 在时钟沿保存当前返回值
+-assign inst_sram_en    = 1'b1;
++// ID 阻塞时同时冻结 RAM 输出和 PC，否则解除阻塞后指令与 PC 会错位。
++assign inst_sram_en    = resetn && allow_in;
+ assign inst_sram_we    = 4'b0;
+ assign inst_sram_addr  = next_pc;
+ assign inst_sram_wdata = 32'b0;
+@@ -43,7 +48,7 @@ always @(posedge clk) begin
+         valid       <= 1'b0;
+         pc          <= 32'h1bfffffc;
+         if_id_valid <= 1'b0;
+-    end else begin
++    end else if (allow_in) begin
+         valid       <= 1'b1;
+         pc          <= next_pc;
+         if_id_valid <= valid && !redirect_i;
+diff --git a/exp7/myCPU/mem_stage.v b/exp8/exp8/myCPU/mem_stage.v
+index b5abd08..3aac1c7 100644
+--- a/exp7/myCPU/mem_stage.v
++++ b/exp8/exp8/myCPU/mem_stage.v
+@@ -1,9 +1,10 @@
+ // MEM：产生数据 SRAM 访问控制，保存 MEM/WB 流水寄存器。
+-// 当前实现也在这里寄存 SRAM 返回数据；其有效时刻须与 RAM 读延迟对应。
++// 同步 RAM 在 MEM/WB 更新的同一上升沿返回数据，返回线直接交给 WB。
+ module mem_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
++    input  wire         allow_in,
+ 
+     // 来自 EX/MEM 的地址、存储数据和控制信号
+     input  wire         ex_mem_valid,
+@@ -15,6 +16,11 @@ module mem_stage (
+     input  wire         ex_mem_gr_we,
+     input  wire [4:0]   ex_mem_dest,
+ 
++    // 当前 MEM 指令的写回意图，反馈给 ID 做相关检测。
++    output wire         mem_pending_we,
++    output wire [4:0]   mem_pending_dest,
++    output wire         ready_go,
++
+     // 数据 SRAM 接口
+     input  wire [31:0]  data_sram_rdata,
+     output wire         data_sram_en,
+@@ -26,19 +32,27 @@ module mem_stage (
+     output reg          mem_wb_valid,
+     output reg  [31:0]  mem_wb_pc,
+     output reg  [31:0]  mem_wb_alu_result,
+-    output reg  [31:0]  mem_wb_mem_result,
++    output wire [31:0]  mem_wb_mem_result,
+     output reg          mem_wb_res_from_mem,
+     output reg          mem_wb_gr_we,
+     output reg  [4:0]   mem_wb_dest
+ );
++assign ready_go = 1'b1;
++
++assign mem_pending_we   = resetn && ex_mem_valid && ex_mem_gr_we && (ex_mem_dest != 5'd0);
++assign mem_pending_dest = ex_mem_dest;
+ 
+-// SRAM 始终使能；仅有效的存储指令开启四个字节的写使能
+-assign data_sram_en    = 1'b1;
+-assign data_sram_we    = {4{ex_mem_mem_we && ex_mem_valid}};
++// 仅有效访存指令访问 SRAM；气泡和复位均不得产生存储副作用。
++assign data_sram_en    = resetn && ex_mem_valid && (ex_mem_mem_we || ex_mem_res_from_mem);
++assign data_sram_we    = {4{resetn && ex_mem_mem_we && ex_mem_valid}};
+ assign data_sram_addr  = ex_mem_alu_result;
+ assign data_sram_wdata = ex_mem_store_data;
+ 
+-// MEM/WB：传递 ALU 结果、当前采样的 SRAM 数据及对应的写回控制。
++// 不在这里再次采样 rdata：非阻塞赋值会采到上一笔请求的数据。
++// RAM/bridge 内部的返回寄存器已经提供这一拍，与 mem_wb_* 对齐。
++assign mem_wb_mem_result = data_sram_rdata;
++
++// MEM/WB：传递 ALU 结果及对应的写回控制。
+ // 复位清除有效位，WB 通过该有效位禁止无效指令写寄存器。
+ always @(posedge clk) begin
+     if (~resetn)
+@@ -47,7 +61,6 @@ always @(posedge clk) begin
+         mem_wb_valid        <= ex_mem_valid;
+         mem_wb_pc           <= ex_mem_pc;
+         mem_wb_alu_result   <= ex_mem_alu_result;
+-        mem_wb_mem_result   <= data_sram_rdata;
+         mem_wb_res_from_mem <= ex_mem_res_from_mem;
+         mem_wb_gr_we        <= ex_mem_gr_we;
+         mem_wb_dest         <= ex_mem_dest;
+diff --git a/exp7/myCPU/mycpu_top.v b/exp8/exp8/myCPU/mycpu_top.v
+index 579ea64..e4bec97 100644
+--- a/exp7/myCPU/mycpu_top.v
++++ b/exp8/exp8/myCPU/mycpu_top.v
+@@ -28,6 +28,13 @@ module mycpu_top (
+ );
+ 
+ // ID → IF：分支反馈
++// exp8：ID 相关阻塞冻结前端，EX/MEM/WB 独立推进以排空旧指令。
++wire         ready_go;
++wire         if_ready_go, id_ready_go, ex_ready_go, mem_ready_go, wb_ready_go;
++wire         ex_pending_we;
++wire [4:0]   ex_pending_dest;
++wire         mem_pending_we;
++wire [4:0]   mem_pending_dest;
+ wire         br_taken;
+ wire [31:0]  br_target;
+ 
+@@ -76,6 +83,8 @@ wire [31:0]  rf_wdata;
+ 
+ // IF：PC、取指和 IF/ID 寄存器
+ if_stage u_if (
++    .allow_in        (ready_go),
++    .ready_go        (if_ready_go),
+     .clk             (clk),
+     .resetn          (resetn),
+     .redirect_i      (br_taken),
+@@ -92,6 +101,12 @@ if_stage u_if (
+ 
+ // ID：译码、寄存器堆、分支判断和 ID/EX 寄存器
+ id_stage u_id (
++    .ex_pending_we      (ex_pending_we),
++    .ex_pending_dest    (ex_pending_dest),
++    .mem_pending_we     (mem_pending_we),
++    .mem_pending_dest   (mem_pending_dest),
++    .ready_go           (ready_go),
++    .allow_in           (ex_ready_go),
+     .clk                (clk),
+     .resetn             (resetn),
+     .if_id_valid        (if_id_valid),
+@@ -118,6 +133,10 @@ id_stage u_id (
+ 
+ // EX：ALU 和 EX/MEM 寄存器
+ ex_stage u_ex (
++    .allow_in            (mem_ready_go),
++    .ready_go            (ex_ready_go),
++    .ex_pending_we       (ex_pending_we),
++    .ex_pending_dest     (ex_pending_dest),
+     .clk                 (clk),
+     .resetn              (resetn),
+     .id_ex_valid         (id_ex_valid),
+@@ -144,6 +163,10 @@ ex_stage u_ex (
+ 
+ // MEM：数据 SRAM 接口和 MEM/WB 寄存器
+ mem_stage u_mem (
++    .allow_in            (wb_ready_go),
++    .ready_go            (mem_ready_go),
++    .mem_pending_we      (mem_pending_we),
++    .mem_pending_dest    (mem_pending_dest),
+     .clk                 (clk),
+     .resetn              (resetn),
+     .ex_mem_valid        (ex_mem_valid),
+@@ -170,6 +193,9 @@ mem_stage u_mem (
+ 
+ // WB：写回选择与调试输出
+ wb_stage u_wb (
++    .allow_in            (1'b1),
++    .ready_go            (wb_ready_go),
++    .resetn              (resetn),
+     .mem_wb_valid        (mem_wb_valid),
+     .mem_wb_pc           (mem_wb_pc),
+     .mem_wb_alu_result   (mem_wb_alu_result),
+diff --git a/exp7/myCPU/wb_stage.v b/exp8/exp8/myCPU/wb_stage.v
+index d359417..90aa317 100644
+--- a/exp7/myCPU/wb_stage.v
++++ b/exp8/exp8/myCPU/wb_stage.v
+@@ -1,6 +1,10 @@
+ // WB：组合选择写回结果，产生寄存器堆写端口和调试输出。
+ // 输入已经来自 MEM/WB 寄存器，因此这里不再增加流水寄存器。
+ module wb_stage (
++    input  wire         resetn,
++    input  wire         allow_in,
++    output wire         ready_go,
++
+     // 来自 MEM/WB 的结果与写回控制
+     input  wire         mem_wb_valid,
+     input  wire [31:0]  mem_wb_pc,
+@@ -21,9 +25,11 @@ module wb_stage (
+     output wire [4:0]   debug_wb_rf_wnum,
+     output wire [31:0]  debug_wb_rf_wdata
+ );
++assign ready_go = 1'b1;
+ 
+ // 写使能必须同时满足“指令有效”和“需要写通用寄存器”
+-assign rf_we    = mem_wb_gr_we && mem_wb_valid;
++// WB 写回同时作为 ID 的相关检测依据；r0 和复位不产生写回。
++assign rf_we    = resetn && mem_wb_gr_we && mem_wb_valid && (mem_wb_dest != 5'd0);
+ assign rf_waddr = mem_wb_dest;
+ assign rf_wdata = mem_wb_res_from_mem ? mem_wb_mem_result : mem_wb_alu_result;
+ 
