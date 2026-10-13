@@ -30,7 +30,6 @@
 
 # Generated implementation products
 *.dcp
-*.bit
 *.bin
 *.ltx
 *.xsa
