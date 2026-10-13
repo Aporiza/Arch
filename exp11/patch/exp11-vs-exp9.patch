@@ -1,0 +1,795 @@
+diff --git a/exp9/exp9/myCPU/alu.v b/exp11/myCPU/alu.v
+index 4650dfc..6900450 100644
+--- a/exp9/exp9/myCPU/alu.v
++++ b/exp11/myCPU/alu.v
+@@ -1,5 +1,6 @@
+ module alu(
+-  input  wire [11:0] alu_op,
++  // [11:0] 为原有算术逻辑操作，[14:12] 为乘法；[18:15] 由 EX 除法器处理。
++  input  wire [18:0] alu_op,
+   input  wire [31:0] alu_src1,
+   input  wire [31:0] alu_src2,
+   output wire [31:0] alu_result
+@@ -17,6 +18,9 @@ wire op_sll;   //logic left shift
+ wire op_srl;   //logic right shift
+ wire op_sra;   //arithmetic right shift
+ wire op_lui;   //Load Upper Immediate
++wire op_mul;   // low 32 bits of signed multiplication
++wire op_mulh;  // high 32 bits of signed multiplication
++wire op_mulhu; // high 32 bits of unsigned multiplication
+ 
+ // control code decomposition
+ assign op_add  = alu_op[ 0];
+@@ -31,6 +35,9 @@ assign op_sll  = alu_op[ 8];
+ assign op_srl  = alu_op[ 9];
+ assign op_sra  = alu_op[10];
+ assign op_lui  = alu_op[11];
++assign op_mul  = alu_op[12];
++assign op_mulh = alu_op[13];
++assign op_mulhu = alu_op[14];
+ 
+ wire [31:0] add_sub_result;
+ wire [31:0] slt_result;
+@@ -44,6 +51,21 @@ wire [31:0] sll_result;
+ wire [63:0] sr64_result;
+ wire [31:0] sr_result;
+ 
++// 乘法先将 32 位操作数扩展为 33 位有符号数：
++// 有符号乘法复制符号位，无符号乘法最高位补 0。
++// 这样可分别得到正确的有符号/无符号高 32 位乘积。
++wire signed [32:0] signed_src1_33   = {alu_src1[31], alu_src1};
++wire signed [32:0] signed_src2_33   = {alu_src2[31], alu_src2};
++wire signed [32:0] unsigned_src1_33 = {1'b0, alu_src1};
++wire signed [32:0] unsigned_src2_33 = {1'b0, alu_src2};
++
++wire signed [65:0] signed_product_66 = signed_src1_33 * signed_src2_33;
++wire signed [65:0] unsigned_product_66 = unsigned_src1_33 * unsigned_src2_33;
++
++// mul.w 的低 32 位对两种乘法相同；高位指令取对应乘积的高 32 位。
++wire [31:0] mul_result   = signed_product_66[31:0];
++wire [31:0] mulh_result  = signed_product_66[63:32];
++wire [31:0] mulhu_result = unsigned_product_66[63:32];
+ 
+ // 32-bit adder
+ wire [31:0] adder_a;
+@@ -103,6 +125,9 @@ assign alu_result = ({32{op_add|op_sub}} & add_sub_result)
+                   | ({32{op_xor       }} & xor_result)
+                   | ({32{op_lui       }} & lui_result)
+                   | ({32{op_sll       }} & sll_result)
+-                  | ({32{op_srl|op_sra}} & sr_result);
++                  | ({32{op_srl|op_sra}} & sr_result)
++                  | ({32{op_mul      }} & mul_result)
++                  | ({32{op_mulh     }} & mulh_result)
++                  | ({32{op_mulhu    }} & mulhu_result);
+ 
+ endmodule
+diff --git a/exp9/exp9/myCPU/ex_stage.v b/exp11/myCPU/ex_stage.v
+index ff4258e..8196e2f 100644
+--- a/exp9/exp9/myCPU/ex_stage.v
++++ b/exp11/myCPU/ex_stage.v
+@@ -11,14 +11,19 @@ module ex_stage (
+     input  wire [31:0]  id_ex_rj_value,
+     input  wire [31:0]  id_ex_rkd_value,
+     input  wire [31:0]  id_ex_imm,
+-    input  wire [11:0]  id_ex_alu_op,
++    input  wire [18:0]  id_ex_alu_op,
+     input  wire         id_ex_src1_is_pc,
+     input  wire         id_ex_src2_is_imm,
+     input  wire         id_ex_res_from_mem,
+     input  wire         id_ex_mem_we,
++    input  wire [1:0]   id_ex_mem_size,
++    input  wire         id_ex_load_unsigned,
+     input  wire         id_ex_gr_we,
+     input  wire [4:0]   id_ex_dest,
+ 
++    // 除法未完成时阻止 ID/EX 接收下一条指令。
++    output wire         allow_in,
++
+     // 当前 EX 指令的相关信息反馈给 ID。
+     // 算术/逻辑结果可直接前递；load 结果尚未返回，需要停顿。
+     output wire         ex_pending_we,
+@@ -34,13 +39,28 @@ module ex_stage (
+     output reg  [31:0]  ex_mem_store_data,
+     output reg          ex_mem_res_from_mem,
+     output reg          ex_mem_mem_we,
++    output reg  [1:0]   ex_mem_mem_size,
++    output reg          ex_mem_load_unsigned,
+     output reg          ex_mem_gr_we,
+     output reg  [4:0]   ex_mem_dest
+ );
+ // ALU 操作数选择：PC 或寄存器值，立即数或第二个寄存器值
+ wire [31:0]  alu_result;
++wire         is_div = |id_ex_alu_op[18:15];
++wire         div_complete;
++reg          div_started;
++wire [31:0]  div_quotient;
++wire [31:0]  div_remainder;
++wire [31:0]  ex_result = is_div
++                       ? ((id_ex_alu_op[15] | id_ex_alu_op[17])
++                          ? div_quotient : div_remainder)
++                       : alu_result;
++
++// complete 属于已启动的这条指令；不能让下一条除法消费旧完成标志。
++assign allow_in = !id_ex_valid || !is_div || (div_started && div_complete);
+ assign ex_pending_we   = resetn && id_ex_valid && id_ex_gr_we &&
+-                         id_ex_res_from_mem && (id_ex_dest != 5'd0);
++                         (id_ex_res_from_mem || (is_div && !div_complete)) &&
++                         (id_ex_dest != 5'd0);
+ assign ex_pending_dest = id_ex_dest;
+ wire [31:0]  alu_src1 = id_ex_src1_is_pc ? id_ex_pc : id_ex_rj_value;
+ wire [31:0]  alu_src2 = id_ex_src2_is_imm ? id_ex_imm : id_ex_rkd_value;
+@@ -52,10 +72,32 @@ alu u_alu (
+     .alu_result (alu_result)
+ );
+ 
++divider u_divider (
++    .clk       (clk),
++    .resetn    (resetn),
++    .start     (resetn && id_ex_valid && is_div && !div_started),
++    .is_signed (id_ex_alu_op[15] | id_ex_alu_op[16]),
++    .dividend  (id_ex_rj_value),
++    .divisor   (id_ex_rkd_value),
++    .complete  (div_complete),
++    .quotient  (div_quotient),
++    .remainder (div_remainder)
++);
++
++always @(posedge clk) begin
++    if (!resetn)
++        div_started <= 1'b0;
++    else if (id_ex_valid && is_div && !div_started)
++        div_started <= 1'b1;
++    else if (allow_in)
++        div_started <= 1'b0;
++end
++
+ assign ex_forward_we   = resetn && id_ex_valid && id_ex_gr_we &&
+-                         !id_ex_res_from_mem && (id_ex_dest != 5'd0);
++                         !id_ex_res_from_mem && allow_in &&
++                         (id_ex_dest != 5'd0);
+ assign ex_forward_dest = id_ex_dest;
+-assign ex_forward_data = alu_result;
++assign ex_forward_data = ex_result;
+ 
+ // EX/MEM：ALU 结果用于算术写回或访存地址。
+ // store_data 直接传递第二个源寄存器值，不使用经过立即数选择的 alu_src2。
+@@ -63,12 +105,14 @@ always @(posedge clk) begin
+     if (~resetn)
+         ex_mem_valid <= 1'b0;
+     else begin
+-        ex_mem_valid        <= id_ex_valid;
++        ex_mem_valid        <= id_ex_valid && allow_in;
+         ex_mem_pc           <= id_ex_pc;
+-        ex_mem_alu_result   <= alu_result;
++        ex_mem_alu_result   <= ex_result;
+         ex_mem_store_data   <= id_ex_rkd_value;
+         ex_mem_res_from_mem <= id_ex_res_from_mem;
+         ex_mem_mem_we       <= id_ex_mem_we;
++        ex_mem_mem_size     <= id_ex_mem_size;
++        ex_mem_load_unsigned <= id_ex_load_unsigned;
+         ex_mem_gr_we        <= id_ex_gr_we;
+         ex_mem_dest         <= id_ex_dest;
+     end
+diff --git a/exp9/exp9/myCPU/id_stage.v b/exp11/myCPU/id_stage.v
+index ad21a48..698940b 100644
+--- a/exp9/exp9/myCPU/id_stage.v
++++ b/exp11/myCPU/id_stage.v
+@@ -28,8 +28,10 @@ module id_stage (
+     input  wire         mem_forward_we,
+     input  wire [4:0]   mem_forward_dest,
+     input  wire [31:0]  mem_forward_data,
+-    // 本阶段可以继续推进时为 1；检测到 load-use 数据相关时为 0。
+-    // 该信号同时冻结 IF，并向 EX 注入气泡。
++    // EX 除法未完成时保持 ID/EX，不能覆盖当前除法指令。
++    input  wire         ex_allow_in,
++    // 无 load-use 相关且 EX 可以接收新指令时为 1。
++    // 为 0 时冻结 IF；仅 load-use 停顿向 EX 注入气泡。
+     output wire         ready_go,
+ 
+     // 反馈给 IF 的分支结果（组合逻辑）
+@@ -42,11 +44,13 @@ module id_stage (
+     output reg  [31:0]  id_ex_rj_value,
+     output reg  [31:0]  id_ex_rkd_value,
+     output reg  [31:0]  id_ex_imm,
+-    output reg  [11:0]  id_ex_alu_op,
++    output reg  [18:0]  id_ex_alu_op,
+     output reg          id_ex_src1_is_pc,
+     output reg          id_ex_src2_is_imm,
+     output reg          id_ex_res_from_mem,
+     output reg          id_ex_mem_we,
++    output reg  [1:0]   id_ex_mem_size,
++    output reg          id_ex_load_unsigned,
+     output reg          id_ex_gr_we,
+     output reg  [4:0]   id_ex_dest
+ );
+@@ -93,64 +97,125 @@ decoder_5_32 u3 (
+ );
+ 
+ // 指令识别：算术、逻辑、移位、访存和跳转
+-wire         inst_add_w   = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[0];
+-wire         inst_sub_w   = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[2];
+-wire         inst_slt     = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[4];
+-wire         inst_sltu    = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[5];
+-wire         inst_nor     = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[8];
+-wire         inst_and     = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[9];
+-wire         inst_or      = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[10];
+-wire         inst_xor     = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[11];
+-wire         inst_slli_w  = op_31_26_d[0] & op_25_22_d[1] & op_21_20_d[0] & op_19_15_d[1];
+-wire         inst_srli_w  = op_31_26_d[0] & op_25_22_d[1] & op_21_20_d[0] & op_19_15_d[9];
+-wire         inst_srai_w  = op_31_26_d[0] & op_25_22_d[1] & op_21_20_d[0] & op_19_15_d[17];
+-wire         inst_addi_w  = op_31_26_d[0] & op_25_22_d[10];
+-wire         inst_ld_w    = op_31_26_d[10] & op_25_22_d[2];
+-wire         inst_st_w    = op_31_26_d[10] & op_25_22_d[6];
+-wire         inst_jirl    = op_31_26_d[19];
+-wire         inst_b       = op_31_26_d[20];
+-wire         inst_bl      = op_31_26_d[21];
+-wire         inst_beq     = op_31_26_d[22];
+-wire         inst_bne     = op_31_26_d[23];
+-wire         inst_lu12i_w = op_31_26_d[5] & ~inst[25];
++wire         inst_add_w     = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[0];
++wire         inst_sub_w     = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[2];
++wire         inst_slt       = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[4];
++wire         inst_sltu      = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[5];
++wire         inst_nor       = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[8];
++wire         inst_and       = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[9];
++wire         inst_or        = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[10];
++wire         inst_xor       = op_31_26_d[0] & op_25_22_d[0] & op_21_20_d[1] & op_19_15_d[11];
++wire         inst_slli_w    = op_31_26_d[0] & op_25_22_d[1] & op_21_20_d[0] & op_19_15_d[1];
++wire         inst_srli_w    = op_31_26_d[0] & op_25_22_d[1] & op_21_20_d[0] & op_19_15_d[9];
++wire         inst_srai_w    = op_31_26_d[0] & op_25_22_d[1] & op_21_20_d[0] & op_19_15_d[17];
++wire         inst_addi_w    = op_31_26_d[0] & op_25_22_d[10];
++wire         inst_ld_w      = op_31_26_d[10] & op_25_22_d[2];
++wire         inst_st_w      = op_31_26_d[10] & op_25_22_d[6];
++// exp11：访存指令共用 op[31:26]，低四位区分访问宽度和符号扩展。
++wire         inst_ld_b      = op_31_26_d[10] & op_25_22_d[0];
++wire         inst_ld_h      = op_31_26_d[10] & op_25_22_d[1];
++wire         inst_ld_bu     = op_31_26_d[10] & op_25_22_d[8];
++wire         inst_ld_hu     = op_31_26_d[10] & op_25_22_d[9];
++wire         inst_st_b      = op_31_26_d[10] & op_25_22_d[4];
++wire         inst_st_h      = op_31_26_d[10] & op_25_22_d[5];
++wire         inst_jirl      = op_31_26_d[19];
++wire         inst_b         = op_31_26_d[20];
++wire         inst_bl        = op_31_26_d[21];
++wire         inst_beq       = op_31_26_d[22];
++wire         inst_bne       = op_31_26_d[23];
++wire         inst_blt       = op_31_26_d[24];
++wire         inst_bge       = op_31_26_d[25];
++wire         inst_bltu      = op_31_26_d[26];
++wire         inst_bgeu      = op_31_26_d[27];
++wire         inst_lu12i_w   = op_31_26_d[5] & ~inst[25];
++wire         inst_pcaddu12i = op_31_26_d[7];
++
++// exp10 新增的立即数、寄存器移位和乘除法指令。
++wire         inst_slti     = op_31_26_d[0] & op_25_22_d[8];
++wire         inst_sltui    = op_31_26_d[0] & op_25_22_d[9];
++wire         inst_andi     = op_31_26_d[0] & op_25_22_d[13];
++wire         inst_ori      = op_31_26_d[0] & op_25_22_d[14];
++wire         inst_xori     = op_31_26_d[0] & op_25_22_d[15];
++wire         inst_sll_w    = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[1] & op_19_15_d[14];
++wire         inst_srl_w    = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[1] & op_19_15_d[15];
++wire         inst_sra_w    = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[1] & op_19_15_d[16];
++wire         inst_mul_w    = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[1] & op_19_15_d[24];
++wire         inst_mulh_w   = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[1] & op_19_15_d[25];
++wire         inst_mulh_wu  = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[1] & op_19_15_d[26];
++wire         inst_div_w    = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[2] & op_19_15_d[0];
++wire         inst_mod_w    = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[2] & op_19_15_d[1];
++wire         inst_div_wu   = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[2] & op_19_15_d[2];
++wire         inst_mod_wu   = op_31_26_d[0] & op_25_22_d[0] &
++                             op_21_20_d[2] & op_19_15_d[3];
+ 
+ // ALU 控制位：各位含义与 alu.v 的 alu_op 接口一致
+-wire [11:0]  alu_op = {
++wire [18:0]  alu_op = {
++    inst_mod_wu,   // [18] 无符号取余
++    inst_div_wu,   // [17] 无符号除法
++    inst_mod_w,    // [16] 有符号取余
++    inst_div_w,    // [15] 有符号除法
++    inst_mulh_wu,  // [14] 无符号乘法高位
++    inst_mulh_w,   // [13] 有符号乘法高位
++    inst_mul_w,    // [12] 乘法低位
+     inst_lu12i_w,  // [11] 高位立即数
+-    inst_srai_w,   // [10] 算术右移
+-    inst_srli_w,   // [ 9] 逻辑右移
+-    inst_slli_w,   // [ 8] 逻辑左移
+-    inst_xor,     // [ 7] 按位异或
+-    inst_or,      // [ 6] 按位或
+-    inst_nor,     // [ 5] 按位或非
+-    inst_and,     // [ 4] 按位与
+-    inst_sltu,    // [ 3] 无符号比较
+-    inst_slt,     // [ 2] 有符号比较
+-    inst_sub_w,   // [ 1] 减法
+-    (inst_add_w | inst_addi_w | inst_ld_w | inst_st_w | inst_jirl | inst_bl) // [0] 加法
++    (inst_srai_w | inst_sra_w),   // [10] 算术右移
++    (inst_srli_w | inst_srl_w),   // [ 9] 逻辑右移
++    (inst_slli_w | inst_sll_w),   // [ 8] 逻辑左移
++    (inst_xor | inst_xori),       // [ 7] 按位异或
++    (inst_or | inst_ori),         // [ 6] 按位或
++    inst_nor,                     // [ 5] 按位或非
++    (inst_and | inst_andi),       // [ 4] 按位与
++    (inst_sltu | inst_sltui),     // [ 3] 无符号比较
++    (inst_slt | inst_slti),       // [ 2] 有符号比较
++    inst_sub_w,                   // [ 1] 减法
++    (inst_add_w | inst_addi_w | inst_ld_w | inst_st_w |
++     inst_ld_b | inst_ld_h | inst_ld_bu | inst_ld_hu |
++     inst_st_b | inst_st_h |
++     inst_jirl | inst_bl | inst_pcaddu12i) // [0] 加法
+ };
+ 
+ // 分支比较和存储指令以 rd 作为第二个源寄存器
+-wire         src_reg_is_rd = inst_beq | inst_bne | inst_st_w;
+-wire         src1_is_pc    = inst_jirl | inst_bl;
++wire         is_cond_branch = inst_beq | inst_bne | inst_blt | inst_bge |
++                              inst_bltu | inst_bgeu;
++wire         is_load = inst_ld_w | inst_ld_b | inst_ld_h | inst_ld_bu | inst_ld_hu;
++wire         is_store = inst_st_w | inst_st_b | inst_st_h;
++wire         src_reg_is_rd = is_cond_branch | is_store;
++wire         src1_is_pc    = inst_jirl | inst_bl | inst_pcaddu12i;
+ wire         src2_is_imm   = inst_slli_w | inst_srli_w | inst_srai_w |
+-                            inst_addi_w | inst_ld_w   | inst_st_w   |
+-                            inst_lu12i_w | inst_jirl  | inst_bl;
++                            inst_addi_w | is_load | is_store |
++                            inst_lu12i_w | inst_jirl  | inst_bl     |
++                            inst_pcaddu12i | inst_slti | inst_sltui |
++                            inst_andi | inst_ori | inst_xori;
+ 
+ // jirl/bl 使用 PC + 4 作为链接地址；lu12i.w 将立即数放入高 20 位
+-wire [31:0]  imm = (inst_jirl | inst_bl) ? 32'd4                  :
+-                   inst_lu12i_w          ? {i20, 12'b0}          :
++wire [31:0]  imm = (inst_jirl | inst_bl) ? 32'd4 :
++                    inst_lu12i_w          ? {i20, 12'b0} :
++                    inst_pcaddu12i        ? {{12{i20[19]}}, i20, 12'b0} :
++                    (inst_andi | inst_ori | inst_xori) ? {20'b0, i12} :
+                                            {{20{i12[11]}}, i12};
+ 
+ // 分支偏移按字对齐：符号扩展后左移两位
+ wire [31:0]  br_offs = (inst_b | inst_bl) ? {{4{i26[25]}}, i26, 2'b0} :
+-                                         {{14{i16[15]}}, i16, 2'b0};
++                                            {{14{i16[15]}}, i16, 2'b0};
+ wire [31:0]  jirl_offs = {{14{i16[15]}}, i16, 2'b0};
+ 
+ // 后续阶段控制：访存结果选择、存储使能、通用寄存器写使能
+-wire         res_from_mem = inst_ld_w,
+-             mem_we = inst_st_w,
+-             gr_we = ~inst_st_w & ~inst_beq & ~inst_bne & ~inst_b;
++wire         res_from_mem = is_load,
++             mem_we = is_store,
++             gr_we = ~is_store & ~is_cond_branch & ~inst_b;
++// 00：字节，01：半字，10：字；无符号标志仅对 load 有意义。
++wire [1:0]   mem_size = (inst_ld_b | inst_ld_bu | inst_st_b) ? 2'b00 :
++                        (inst_ld_h | inst_ld_hu | inst_st_h) ? 2'b01 : 2'b10;
++wire         load_unsigned = inst_ld_bu | inst_ld_hu;
+ 
+ // bl 写入 r1；其余指令的目的寄存器来自 rd
+ wire [4:0]   dest      = inst_bl ? 5'd1 : rd;
+@@ -178,26 +243,36 @@ assign rkd_value = (rf_raddr2 != 5'd0 && ex_forward_we &&
+                  ? rf_wdata
+                  : rkd_rf_value;
+ wire         rj_eq_rd = (rj_value == rkd_value);
++wire         rj_lt_rd  = $signed(rj_value) < $signed(rkd_value);
++wire         rj_ltu_rd = rj_value < rkd_value;
+ 
+ // 只检查指令真正读取的源寄存器，避免把立即数字段误判成寄存器。
+ wire use_rj = inst_add_w | inst_sub_w | inst_slt | inst_sltu |
+               inst_nor | inst_and | inst_or | inst_xor |
+               inst_slli_w | inst_srli_w | inst_srai_w | inst_addi_w |
+-              inst_ld_w | inst_st_w | inst_jirl | inst_beq | inst_bne;
++              inst_sll_w | inst_srl_w | inst_sra_w |
++              inst_slti | inst_sltui | inst_andi | inst_ori | inst_xori |
++              inst_mul_w | inst_mulh_w | inst_mulh_wu |
++              inst_div_w | inst_mod_w | inst_div_wu | inst_mod_wu |
++              is_load | is_store | inst_jirl | is_cond_branch;
+ wire use_rkd = inst_add_w | inst_sub_w | inst_slt | inst_sltu |
+                inst_nor | inst_and | inst_or | inst_xor |
+-               inst_st_w | inst_beq | inst_bne;
++               inst_sll_w | inst_srl_w | inst_sra_w |
++               inst_mul_w | inst_mulh_w | inst_mulh_wu |
++               inst_div_w | inst_mod_w | inst_div_wu | inst_mod_wu |
++               is_store | is_cond_branch;
+ 
+ // 只有 load 结果不能在当前周期前递，故 EX/MEM 中的 load 才会阻塞。
+ // ALU 结果从 EX、EX/MEM 前递，WB 结果从写回端口前递；r0 恒为零。
+-// st.w 的存储数据和分支操作数也必须检查。
++// 存储数据和分支操作数也必须检查。
+ wire hazard_rj = use_rj && (rj != 5'd0) &&
+                  ((ex_pending_we  && ex_pending_dest  == rj) ||
+                   (mem_pending_we && mem_pending_dest == rj));
+ wire hazard_rkd = use_rkd && (rf_raddr2 != 5'd0) &&
+                   ((ex_pending_we  && ex_pending_dest  == rf_raddr2) ||
+                    (mem_pending_we && mem_pending_dest == rf_raddr2));
+-assign ready_go = !(resetn && if_id_valid && (hazard_rj || hazard_rkd));
++assign ready_go = ex_allow_in &&
++                  !(resetn && if_id_valid && (hazard_rj || hazard_rkd));
+ 
+ // 寄存器堆：ID 提供读地址，WB 提供写使能、目的寄存器号和写回数据
+ regfile u_rf (
+@@ -211,11 +286,15 @@ regfile u_rf (
+     .wdata  (rf_wdata)
+ );
+ 
+-// 只有有效指令才能发起跳转；beq/bne 比较寄存器值，b/bl/jirl 无条件跳转
++// 有符号与无符号分支分别比较；只有有效且可以前进的指令才允许改写 PC。
+ assign br_taken = ((inst_beq & rj_eq_rd) |
+                    (inst_bne & ~rj_eq_rd) |
++                   (inst_blt & rj_lt_rd) |
++                   (inst_bge & ~rj_lt_rd) |
++                   (inst_bltu & rj_ltu_rd) |
++                   (inst_bgeu & ~rj_ltu_rd) |
+                    inst_jirl | inst_bl | inst_b) & if_id_valid & ready_go & resetn;
+-assign br_target = (inst_beq | inst_bne | inst_bl | inst_b)
++assign br_target = (is_cond_branch | inst_bl | inst_b)
+                  ? if_id_pc + br_offs
+                  : rj_value + jirl_offs;
+ 
+@@ -223,7 +302,9 @@ assign br_target = (inst_beq | inst_bne | inst_bl | inst_b)
+ always @(posedge clk) begin
+     if (reset)
+         id_ex_valid <= 1'b0;
+-    else if (!ready_go)
++    else if (!ex_allow_in) begin
++        // EX 正在执行多周期除法，保持本级流水寄存器。
++    end else if (!ready_go)
+         // 前端保持当前指令，后端继续前进；向 EX 注入一个无效槽。
+         id_ex_valid <= 1'b0;
+     else begin
+@@ -237,6 +318,8 @@ always @(posedge clk) begin
+         id_ex_src2_is_imm  <= src2_is_imm;
+         id_ex_res_from_mem <= res_from_mem;
+         id_ex_mem_we       <= mem_we;
++        id_ex_mem_size     <= mem_size;
++        id_ex_load_unsigned <= load_unsigned;
+         id_ex_gr_we        <= gr_we;
+         id_ex_dest         <= dest;
+     end
+diff --git a/exp9/exp9/myCPU/mem_stage.v b/exp11/myCPU/mem_stage.v
+index 4f422ef..eb64aac 100644
+--- a/exp9/exp9/myCPU/mem_stage.v
++++ b/exp11/myCPU/mem_stage.v
+@@ -13,6 +13,8 @@ module mem_stage (
+     input  wire [31:0]  ex_mem_store_data,
+     input  wire         ex_mem_res_from_mem,
+     input  wire         ex_mem_mem_we,
++    input  wire [1:0]   ex_mem_mem_size,
++    input  wire         ex_mem_load_unsigned,
+     input  wire         ex_mem_gr_we,
+     input  wire [4:0]   ex_mem_dest,
+ 
+@@ -40,6 +42,9 @@ module mem_stage (
+     output reg  [31:0]  mem_wb_alu_result,
+     output wire [31:0]  mem_wb_mem_result,
+     output reg          mem_wb_res_from_mem,
++    output reg  [1:0]   mem_wb_mem_size,
++    output reg          mem_wb_load_unsigned,
++    output reg  [1:0]   mem_wb_addr_low,
+     output reg          mem_wb_gr_we,
+     output reg  [4:0]   mem_wb_dest
+ );
+@@ -57,9 +62,16 @@ assign mem_forward_data = ex_mem_alu_result;
+ 
+ // 仅有效访存指令访问 SRAM；气泡和复位均不得产生存储副作用。
+ assign data_sram_en    = resetn && ex_mem_valid && (ex_mem_mem_we || ex_mem_res_from_mem);
+-assign data_sram_we    = {4{resetn && ex_mem_mem_we && ex_mem_valid}};
++// RAM 是 32 位、4 路字节写使能。字节/半字存储只打开对应 lane，
++// 写数据在相应 lane 复制，兼容 BRAM 和外设桥的 byte-enable 语义。
++assign data_sram_we = !resetn || !ex_mem_valid || !ex_mem_mem_we ? 4'b0000 :
++                      (ex_mem_mem_size == 2'b00) ? (4'b0001 << ex_mem_alu_result[1:0]) :
++                      (ex_mem_mem_size == 2'b01) ? (ex_mem_alu_result[1] ? 4'b1100 : 4'b0011) :
++                                                   4'b1111;
+ assign data_sram_addr  = ex_mem_alu_result;
+-assign data_sram_wdata = ex_mem_store_data;
++assign data_sram_wdata = (ex_mem_mem_size == 2'b00) ? {4{ex_mem_store_data[7:0]}} :
++                         (ex_mem_mem_size == 2'b01) ? {2{ex_mem_store_data[15:0]}} :
++                                                       ex_mem_store_data;
+ 
+ // 不在这里再次采样 rdata：非阻塞赋值会采到上一笔请求的数据。
+ // RAM/bridge 内部的返回寄存器已经提供这一拍，与 mem_wb_* 对齐。
+@@ -75,6 +87,9 @@ always @(posedge clk) begin
+         mem_wb_pc           <= ex_mem_pc;
+         mem_wb_alu_result   <= ex_mem_alu_result;
+         mem_wb_res_from_mem <= ex_mem_res_from_mem;
++        mem_wb_mem_size     <= ex_mem_mem_size;
++        mem_wb_load_unsigned <= ex_mem_load_unsigned;
++        mem_wb_addr_low     <= ex_mem_alu_result[1:0];
+         mem_wb_gr_we        <= ex_mem_gr_we;
+         mem_wb_dest         <= ex_mem_dest;
+     end
+diff --git a/exp9/exp9/myCPU/mycpu_top.v b/exp11/myCPU/mycpu_top.v
+index 8906650..b943242 100644
+--- a/exp9/exp9/myCPU/mycpu_top.v
++++ b/exp11/myCPU/mycpu_top.v
+@@ -28,9 +28,9 @@ module mycpu_top (
+ );
+ 
+ // ID → IF：分支反馈和前端冻结控制。
+-// exp9：ALU 结果从 EX、EX/MEM 前递，load-use 相关时冻结前端。
+-// 各级流水线每拍固定推进，因此不再保留无效的 ready_go/allow_in 握手线。
++// EX 的多周期除法通过 allow_in 冻结 ID/IF。
+ wire         ready_go;
++wire         ex_allow_in;
+ wire         ex_pending_we;
+ wire [4:0]   ex_pending_dest;
+ wire         ex_forward_we;
+@@ -55,12 +55,15 @@ wire [31:0]  id_ex_pc,
+              id_ex_rj_value,
+              id_ex_rkd_value,
+              id_ex_imm;
+-wire [11:0]  id_ex_alu_op;
++// [11:0] 为原有 ALU 控制，[18:12] 为 mul/div 控制。
++wire [18:0]  id_ex_alu_op;
+ wire         id_ex_src1_is_pc,
+              id_ex_src2_is_imm,
+              id_ex_res_from_mem,
+              id_ex_mem_we,
++             id_ex_load_unsigned,
+              id_ex_gr_we;
++wire [1:0]   id_ex_mem_size;
+ wire [4:0]   id_ex_dest;
+ 
+ // EX → MEM：运算结果、存储数据和后续阶段控制
+@@ -70,7 +73,9 @@ wire [31:0]  ex_mem_pc,
+              ex_mem_store_data;
+ wire         ex_mem_res_from_mem,
+              ex_mem_mem_we,
++             ex_mem_load_unsigned,
+              ex_mem_gr_we;
++wire [1:0]   ex_mem_mem_size;
+ wire [4:0]   ex_mem_dest;
+ 
+ // MEM → WB：写回数据和控制
+@@ -79,7 +84,10 @@ wire [31:0]  mem_wb_pc,
+              mem_wb_alu_result,
+              mem_wb_mem_result;
+ wire         mem_wb_res_from_mem,
++             mem_wb_load_unsigned,
+              mem_wb_gr_we;
++wire [1:0]   mem_wb_mem_size,
++             mem_wb_addr_low;
+ wire [4:0]   mem_wb_dest;
+ 
+ // WB → ID：寄存器堆写回
+@@ -116,6 +124,7 @@ id_stage u_id (
+     .mem_forward_we     (mem_forward_we),
+     .mem_forward_dest   (mem_forward_dest),
+     .mem_forward_data   (mem_forward_data),
++    .ex_allow_in        (ex_allow_in),
+     .ready_go           (ready_go),
+     .clk                (clk),
+     .resetn             (resetn),
+@@ -137,12 +146,15 @@ id_stage u_id (
+     .id_ex_src2_is_imm  (id_ex_src2_is_imm),
+     .id_ex_res_from_mem (id_ex_res_from_mem),
+     .id_ex_mem_we       (id_ex_mem_we),
++    .id_ex_mem_size     (id_ex_mem_size),
++    .id_ex_load_unsigned(id_ex_load_unsigned),
+     .id_ex_gr_we        (id_ex_gr_we),
+     .id_ex_dest         (id_ex_dest)
+ );
+ 
+ // EX：ALU 和 EX/MEM 寄存器
+ ex_stage u_ex (
++    .allow_in            (ex_allow_in),
+     .ex_pending_we       (ex_pending_we),
+     .ex_pending_dest     (ex_pending_dest),
+     .ex_forward_we       (ex_forward_we),
+@@ -160,6 +172,8 @@ ex_stage u_ex (
+     .id_ex_src2_is_imm   (id_ex_src2_is_imm),
+     .id_ex_res_from_mem  (id_ex_res_from_mem),
+     .id_ex_mem_we        (id_ex_mem_we),
++    .id_ex_mem_size      (id_ex_mem_size),
++    .id_ex_load_unsigned (id_ex_load_unsigned),
+     .id_ex_gr_we         (id_ex_gr_we),
+     .id_ex_dest          (id_ex_dest),
+     .ex_mem_valid        (ex_mem_valid),
+@@ -168,6 +182,8 @@ ex_stage u_ex (
+     .ex_mem_store_data   (ex_mem_store_data),
+     .ex_mem_res_from_mem (ex_mem_res_from_mem),
+     .ex_mem_mem_we       (ex_mem_mem_we),
++    .ex_mem_mem_size     (ex_mem_mem_size),
++    .ex_mem_load_unsigned(ex_mem_load_unsigned),
+     .ex_mem_gr_we        (ex_mem_gr_we),
+     .ex_mem_dest         (ex_mem_dest)
+ );
+@@ -187,6 +203,8 @@ mem_stage u_mem (
+     .ex_mem_store_data   (ex_mem_store_data),
+     .ex_mem_res_from_mem (ex_mem_res_from_mem),
+     .ex_mem_mem_we       (ex_mem_mem_we),
++    .ex_mem_mem_size     (ex_mem_mem_size),
++    .ex_mem_load_unsigned(ex_mem_load_unsigned),
+     .ex_mem_gr_we        (ex_mem_gr_we),
+     .ex_mem_dest         (ex_mem_dest),
+     .data_sram_rdata     (data_sram_rdata),
+@@ -199,6 +217,9 @@ mem_stage u_mem (
+     .mem_wb_alu_result   (mem_wb_alu_result),
+     .mem_wb_mem_result   (mem_wb_mem_result),
+     .mem_wb_res_from_mem (mem_wb_res_from_mem),
++    .mem_wb_mem_size     (mem_wb_mem_size),
++    .mem_wb_load_unsigned(mem_wb_load_unsigned),
++    .mem_wb_addr_low     (mem_wb_addr_low),
+     .mem_wb_gr_we        (mem_wb_gr_we),
+     .mem_wb_dest         (mem_wb_dest)
+ );
+@@ -211,6 +232,9 @@ wb_stage u_wb (
+     .mem_wb_alu_result   (mem_wb_alu_result),
+     .mem_wb_mem_result   (mem_wb_mem_result),
+     .mem_wb_res_from_mem (mem_wb_res_from_mem),
++    .mem_wb_mem_size     (mem_wb_mem_size),
++    .mem_wb_load_unsigned(mem_wb_load_unsigned),
++    .mem_wb_addr_low     (mem_wb_addr_low),
+     .mem_wb_gr_we        (mem_wb_gr_we),
+     .mem_wb_dest         (mem_wb_dest),
+     .rf_we               (rf_we),
+diff --git a/exp9/exp9/myCPU/tools.v b/exp11/myCPU/tools.v
+index ee43e3a..152dff6 100644
+--- a/exp9/exp9/myCPU/tools.v
++++ b/exp11/myCPU/tools.v
+@@ -4,20 +4,100 @@ module decoder_2_4(
+ );
+ 
+ genvar i;
+-generate for (i=0; i<4; i=i+1) begin : gen_for_dec_2_4
++generate for (i=0; i<4; i=i+1) begin
+     assign out[i] = (in == i);
+ end endgenerate
+ 
+ endmodule
+ 
+ 
++// 32 位恢复除法器：每拍生成一位商，商和余数在 complete 时有效。
++// start 只需保持一拍；运算期间调用方应保持对应指令和控制信息。
++module divider (
++    input  wire        clk,
++    input  wire        resetn,
++    input  wire        start,
++    input  wire        is_signed,
++    input  wire [31:0] dividend,
++    input  wire [31:0] divisor,
++    output reg         complete,
++    output reg  [31:0] quotient,
++    output reg  [31:0] remainder
++);
++
++reg         busy;
++reg  [31:0] divisor_abs;
++reg  [31:0] quotient_work;
++reg  [32:0] remainder_work;
++reg  [5:0]  count;
++reg         quotient_negative;
++reg         remainder_negative;
++
++wire dividend_negative = is_signed && dividend[31];
++wire divisor_negative  = is_signed && divisor[31];
++wire [31:0] dividend_abs = dividend_negative ? -dividend : dividend;
++wire [31:0] divisor_abs_in = divisor_negative ? -divisor : divisor;
++
++wire [32:0] trial_remainder = {remainder_work[31:0], quotient_work[31]};
++wire          subtract_ok = trial_remainder >= {1'b0, divisor_abs};
++wire [32:0]   next_remainder = subtract_ok
++                             ? trial_remainder - {1'b0, divisor_abs}
++                             : trial_remainder;
++wire [31:0]   next_quotient = {quotient_work[30:0], subtract_ok};
++
++always @(posedge clk) begin
++    if (!resetn) begin
++        busy               <= 1'b0;
++        complete           <= 1'b0;
++        quotient           <= 32'b0;
++        remainder          <= 32'b0;
++        divisor_abs        <= 32'b0;
++        quotient_work      <= 32'b0;
++        remainder_work     <= 33'b0;
++        count              <= 6'b0;
++        quotient_negative  <= 1'b0;
++        remainder_negative <= 1'b0;
++    end else begin
++        complete <= 1'b0;
++        if (start && !busy) begin
++            if (divisor == 32'b0) begin
++                quotient  <= 32'hffff_ffff;
++                remainder <= dividend;
++                complete  <= 1'b1;
++            end else begin
++                busy               <= 1'b1;
++                divisor_abs        <= divisor_abs_in;
++                quotient_work      <= dividend_abs;
++                remainder_work     <= 33'b0;
++                count              <= 6'd32;
++                quotient_negative  <= dividend_negative ^ divisor_negative;
++                remainder_negative <= dividend_negative;
++            end
++        end else if (busy) begin
++            quotient_work  <= next_quotient;
++            remainder_work <= next_remainder;
++            count          <= count - 6'd1;
++            if (count == 6'd1) begin
++                busy      <= 1'b0;
++                complete  <= 1'b1;
++                quotient  <= quotient_negative ? -next_quotient : next_quotient;
++                remainder <= remainder_negative ? -next_remainder[31:0]
++                                                : next_remainder[31:0];
++            end
++        end
++    end
++end
++
++endmodule
++
++
+ module decoder_4_16(
+     input  wire [ 3:0] in,
+     output wire [15:0] out
+ );
+ 
+ genvar i;
+-generate for (i=0; i<16; i=i+1) begin : gen_for_dec_4_16
++generate for (i=0; i<16; i=i+1) begin
+     assign out[i] = (in == i);
+ end endgenerate
+ 
+@@ -30,7 +110,7 @@ module decoder_5_32(
+ );
+ 
+ genvar i;
+-generate for (i=0; i<32; i=i+1) begin : gen_for_dec_5_32
++generate for (i=0; i<32; i=i+1) begin
+     assign out[i] = (in == i);
+ end endgenerate
+ 
+@@ -43,7 +123,7 @@ module decoder_6_64(
+ );
+ 
+ genvar i;
+-generate for (i=0; i<64; i=i+1) begin : gen_for_dec_6_64
++generate for (i=0; i<64; i=i+1) begin
+     assign out[i] = (in == i);
+ end endgenerate
+ 
+diff --git a/exp9/exp9/myCPU/wb_stage.v b/exp11/myCPU/wb_stage.v
+index 74e8f65..c3ba6d5 100644
+--- a/exp9/exp9/myCPU/wb_stage.v
++++ b/exp11/myCPU/wb_stage.v
+@@ -10,6 +10,9 @@ module wb_stage (
+     input  wire [31:0]  mem_wb_alu_result,
+     input  wire [31:0]  mem_wb_mem_result,
+     input  wire         mem_wb_res_from_mem,
++    input  wire [1:0]   mem_wb_mem_size,
++    input  wire         mem_wb_load_unsigned,
++    input  wire [1:0]   mem_wb_addr_low,
+     input  wire         mem_wb_gr_we,
+     input  wire [4:0]   mem_wb_dest,
+ 
+@@ -24,11 +27,26 @@ module wb_stage (
+     output wire [4:0]   debug_wb_rf_wnum,
+     output wire [31:0]  debug_wb_rf_wdata
+ );
++// 同步 RAM 返回一个对齐的 32 位字，按原始地址低位取出 load 的有效部分。
++wire [7:0] load_byte = (mem_wb_addr_low == 2'b00) ? mem_wb_mem_result[7:0] :
++                       (mem_wb_addr_low == 2'b01) ? mem_wb_mem_result[15:8] :
++                       (mem_wb_addr_low == 2'b10) ? mem_wb_mem_result[23:16] :
++                                                    mem_wb_mem_result[31:24];
++wire [15:0] load_half = mem_wb_addr_low[1] ? mem_wb_mem_result[31:16] :
++                                                   mem_wb_mem_result[15:0];
++wire [31:0] load_result = (mem_wb_mem_size == 2'b00) ?
++                          (mem_wb_load_unsigned ? {24'b0, load_byte} :
++                                                   {{24{load_byte[7]}}, load_byte}) :
++                          (mem_wb_mem_size == 2'b01) ?
++                          (mem_wb_load_unsigned ? {16'b0, load_half} :
++                                                   {{16{load_half[15]}}, load_half}) :
++                          mem_wb_mem_result;
++
+ // 写使能必须同时满足“指令有效”和“需要写通用寄存器”
+ // WB 写回同时作为 ID 的相关检测依据；r0 和复位不产生写回。
+ assign rf_we    = resetn && mem_wb_gr_we && mem_wb_valid && (mem_wb_dest != 5'd0);
+ assign rf_waddr = mem_wb_dest;
+-assign rf_wdata = mem_wb_res_from_mem ? mem_wb_mem_result : mem_wb_alu_result;
++assign rf_wdata = mem_wb_res_from_mem ? load_result : mem_wb_alu_result;
+ 
+ // 调试信号与实际寄存器堆写端口保持对应
+ assign debug_wb_pc       = mem_wb_pc;
