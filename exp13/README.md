@@ -7,7 +7,7 @@
 在 `exp12/myCPU` 的基础上扩展 `exp13/myCPU`：
 
 - ID 检测 ADEF、BRK、INE 和中断，EX 检测字/半字访存的 ALE。
-- 39 位异常总线携带有效位、Ecode 和 BADV，WB 统一保存异常状态并跳转。
+- 38 位异常总线携带 6 类独立异常标志和 BADV/PC；WB 按架构优先级编码 ECODE，统一保存异常状态并跳转。
 - 异常指令及其后的指令不得写通用寄存器、CSR 或数据 SRAM；冲刷可取消除法。
 - 新增 ECFG、BADV、TID、TCFG、TVAL、TICLR。BADV 仅在地址异常时更新。
 - 支持两路软件中断、八路硬件中断、定时器中断，由 CRMD.IE 与 ECFG.LIE 共同屏蔽。

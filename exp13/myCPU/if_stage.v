@@ -30,10 +30,13 @@ wire         reset = ~resetn;
 
 // 顺序取指加 4；重定向时改用分支目标
 wire [31:0]  next_pc = redirect_i ? redirect_pc_i : pc + 32'd4;
+// ADEF 只针对未按 4 字节对齐的取指地址。非法地址不发起 SRAM 请求，
+// 但仍把该 PC 作为异常流水项送入 ID，由 ID 产生精确异常标志。
+wire         next_pc_adef = |next_pc[1:0];
 
 // 同步指令 RAM 使用 next_pc 发起读取；IF/ID 在时钟沿保存当前返回值
 // ID 阻塞时同时冻结 RAM 输出和 PC，否则解除阻塞后指令与 PC 会错位。
-assign inst_sram_en    = resetn && allow_in;
+assign inst_sram_en    = resetn && allow_in && !next_pc_adef;
 assign inst_sram_we    = 4'b0;
 assign inst_sram_addr  = next_pc;
 assign inst_sram_wdata = 32'b0;

@@ -22,7 +22,7 @@ module ex_stage (
     input  wire         id_ex_gr_we,
     input  wire [4:0]   id_ex_dest,
     input  wire [83:0]  id_ex_csr_bus,
-    input  wire [38:0]  id_ex_ex_bus,
+    input  wire [37:0]  id_ex_ex_bus,
 
     // 除法未完成时阻止 ID/EX 接收下一条指令。
     output wire         allow_in,
@@ -47,7 +47,7 @@ module ex_stage (
     output reg          ex_mem_gr_we,
     output reg  [4:0]   ex_mem_dest,
     output reg  [83:0]  ex_mem_csr_bus,
-    output reg  [38:0]  ex_mem_ex_bus
+    output reg  [37:0]  ex_mem_ex_bus
 );
 // ALU 操作数选择：PC 或寄存器值，立即数或第二个寄存器值
 wire [31:0]  alu_result;
@@ -64,7 +64,7 @@ wire [31:0]  ex_result = is_div
 // complete 属于已启动的这条指令；不能让下一条除法消费旧完成标志。
 assign allow_in = !id_ex_valid || !is_div || (div_started && div_complete);
 assign ex_pending_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
-                         (id_ex_res_from_mem || (|id_ex_csr_bus[83:81]) ||
+                         (id_ex_res_from_mem || id_ex_csr_bus[81] || id_ex_csr_bus[80] ||
                           (is_div && !div_complete)) &&
                          (id_ex_dest != 5'd0);
 assign ex_pending_dest = id_ex_dest;
@@ -74,7 +74,7 @@ wire [31:0]  alu_src2 = id_ex_src2_is_imm ? id_ex_imm : id_ex_rkd_value;
 wire ale = (id_ex_res_from_mem || id_ex_mem_we) &&
            (((id_ex_mem_size == 2'b10) && (|alu_result[1:0])) ||
             ((id_ex_mem_size == 2'b01) && alu_result[0]));
-wire ex_exception = id_ex_ex_bus[38] || ale;
+wire ex_exception = (|id_ex_ex_bus[37:32]) || ale;
 
 alu u_alu (
     .alu_op     (id_ex_alu_op),
@@ -106,7 +106,7 @@ always @(posedge clk) begin
 end
 
 assign ex_forward_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
-                         !id_ex_res_from_mem && !(|id_ex_csr_bus[83:81]) &&
+                         !id_ex_res_from_mem && !id_ex_csr_bus[81] && !id_ex_csr_bus[80] &&
                          !ex_exception && allow_in &&
                          (id_ex_dest != 5'd0);
 assign ex_forward_dest = id_ex_dest;
@@ -129,8 +129,9 @@ always @(posedge clk) begin
         ex_mem_gr_we        <= id_ex_gr_we && !ex_exception;
         ex_mem_dest         <= id_ex_dest;
         ex_mem_csr_bus      <= id_ex_csr_bus;
-        ex_mem_ex_bus       <= id_ex_ex_bus[38] ? id_ex_ex_bus :
-                               {ale, 6'h09, alu_result};
+        ex_mem_ex_bus       <= (|id_ex_ex_bus[37:32]) ? id_ex_ex_bus :
+                               {ale ? 6'b001000 : 6'b0,
+                                ale ? alu_result : id_ex_ex_bus[31:0]};
     end
 end
 

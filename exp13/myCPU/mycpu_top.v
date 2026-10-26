@@ -103,11 +103,10 @@ wire [31:0]  rf_wdata;
 wire [83:0]  id_ex_csr_bus;
 wire [83:0]  ex_mem_csr_bus;
 wire [83:0]  mem_wb_csr_bus;
-wire [38:0]  id_ex_ex_bus;
-wire [38:0]  ex_mem_ex_bus;
-wire [38:0]  mem_wb_ex_bus;
+wire [37:0]  id_ex_ex_bus;
+wire [37:0]  ex_mem_ex_bus;
+wire [37:0]  mem_wb_ex_bus;
 wire         has_int;
-wire [1:0]   current_plv;
 wire         csr_pending = (id_ex_valid && id_ex_csr_bus[80]) ||
                            (ex_mem_valid && ex_mem_csr_bus[80]) ||
                            (mem_wb_valid && mem_wb_csr_bus[80]);
@@ -135,7 +134,6 @@ if_stage u_if (
 // ID：译码、寄存器堆、分支判断和 ID/EX 寄存器
 id_stage u_id (
     .has_int           (has_int),
-    .current_plv       (current_plv),
     .csr_pending       (csr_pending),
     .id_ex_ex_bus      (id_ex_ex_bus),
     .flush             (flush),
@@ -264,7 +262,6 @@ mem_stage u_mem (
 wb_stage u_wb (
     .hw_int_in           (hw_int_in),
     .has_int             (has_int),
-    .current_plv         (current_plv),
     .mem_wb_ex_bus        (mem_wb_ex_bus),
     .clk                 (clk),
     .mem_wb_csr_bus      (mem_wb_csr_bus),

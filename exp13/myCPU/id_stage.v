@@ -1,4 +1,6 @@
 
+`include "csr_defs.vh"
+
 // ID：指令译码、寄存器堆读写、立即数生成和分支判断。
 // 译码结果和操作数在时钟上升沿一起进入 ID/EX 流水寄存器。
 module id_stage (
@@ -7,7 +9,6 @@ module id_stage (
     input  wire         resetn,
     input  wire         flush,
     input  wire         has_int,
-    input  wire [1:0]   current_plv,
     input  wire         csr_pending,
 
     // 来自 IF/ID 的指令与 PC
@@ -61,8 +62,8 @@ module id_stage (
     // [63:32]: 写掩码；[31:0]: 写数据。随指令传到 WB 提交。
     // [83:82]: {rdcntvh, rdcntvl}，其余位保持 exp12 布局。
     output reg  [83:0]  id_ex_csr_bus,
-    // {异常有效, Ecode[5:0], BADV[31:0]}；本实验 EsubCode 均为零。
-    output reg  [38:0]  id_ex_ex_bus
+    // {异常标志[5:0], BADV/PC[31:0]}，异常编码在 WB 再统一生成。
+    output reg  [37:0]  id_ex_ex_bus
 );
 
 // 指令字段提取
@@ -215,11 +216,12 @@ wire         is_store = inst_st_w | inst_st_b | inst_st_h;
 wire         inst_valid = (|alu_op) | is_cond_branch | inst_b | csr_re |
                           inst_ertn | inst_syscall | inst_break |
                           inst_rdcntvl | inst_rdcntvh;
-wire         adef = (|if_id_pc[1:0]) || ((current_plv == 2'd3) && if_id_pc[31]);
-// 优先级：中断 > 取指地址错 > 译码异常；ALE 在 EX 检测。
-wire         id_exception = has_int | adef | inst_syscall | inst_break | !inst_valid;
-wire [5:0]   id_ecode = has_int ? 6'h00 : adef ? 6'h08 :
-                       inst_syscall ? 6'h0b : inst_break ? 6'h0c : 6'h0d;
+// ADEF 只表示取指地址未按 4 字节对齐；高地址本身不是本实验的 ADEF。
+wire         adef = |if_id_pc[1:0];
+// 各类异常独立下传，WB 再按 INT>ADEF>SYS>BRK>INE 的顺序编码 ECODE。
+wire [5:0]   id_ex_flags = {has_int, adef, 1'b0, inst_syscall,
+                            inst_break, !inst_valid};
+wire         id_exception = |id_ex_flags;
 wire         src_reg_is_rd = is_cond_branch | is_store | csr_we;
 wire         src1_is_pc    = inst_jirl | inst_bl | inst_pcaddu12i;
 wire         src2_is_imm   = inst_slli_w | inst_srli_w | inst_srai_w |
@@ -357,7 +359,7 @@ always @(posedge clk) begin
         id_ex_load_unsigned <= load_unsigned;
         id_ex_gr_we        <= gr_we;
         id_ex_dest         <= dest;
-        id_ex_ex_bus       <= {id_exception, id_ecode, if_id_pc};
+        id_ex_ex_bus       <= {id_ex_flags, if_id_pc};
         id_ex_csr_bus      <= {inst_rdcntvh, inst_rdcntvl,
                                csr_re, csr_we && !id_exception,
                                inst_ertn && !id_exception, inst_syscall,

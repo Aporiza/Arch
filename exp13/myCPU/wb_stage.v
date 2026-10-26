@@ -1,4 +1,6 @@
-// WB：选择写回结果，产生寄存器堆写端口、调试输出并提交 CSR 状态。
+`include "csr_defs.vh"
+
+// WB：选择写回结果，产生寄存器堆写端口并提交 CSR/异常状态。
 // 输入已经来自 MEM/WB 寄存器，因此这里不再增加流水寄存器。
 // WB 固定每拍提交，无需 allow_in/ready_go；CSR 在本拍末的上升沿更新。
 module wb_stage (
@@ -6,7 +8,6 @@ module wb_stage (
     input  wire         resetn,
     input  wire [7:0]   hw_int_in,
     output wire        has_int,
-    output wire [1:0]  current_plv,
 
     // 来自 MEM/WB 的结果与写回控制
     input  wire         mem_wb_valid,
@@ -20,7 +21,7 @@ module wb_stage (
     input  wire         mem_wb_gr_we,
     input  wire [4:0]   mem_wb_dest,
     input  wire [83:0]  mem_wb_csr_bus,
-    input  wire [38:0]  mem_wb_ex_bus,
+    input  wire [37:0]  mem_wb_ex_bus,
 
     // 在 WB 统一处理精确异常及返回，冲刷所有更年轻的指令。
     output wire         flush,
@@ -48,7 +49,13 @@ wire [31:0] csr_rdata;
 wire [31:0] ex_entry;
 wire [31:0] ex_era;
 wire [63:0] stable_counter;
-wire        wb_ex = resetn && mem_wb_valid && mem_wb_ex_bus[38];
+wire [5:0]  wb_ecode = mem_wb_ex_bus[37] ? `ECODE_INT :
+                       mem_wb_ex_bus[36] ? `ECODE_ADE :
+                       mem_wb_ex_bus[35] ? `ECODE_ALE :
+                       mem_wb_ex_bus[34] ? `ECODE_SYS :
+                       mem_wb_ex_bus[33] ? `ECODE_BRK : `ECODE_INE;
+wire [8:0]  wb_esubcode = 9'b0;
+wire        wb_ex = resetn && mem_wb_valid && (|mem_wb_ex_bus[37:32]);
 wire        ertn_flush = resetn && mem_wb_valid && ertn && !wb_ex;
 
 assign {csr_re, csr_we, ertn, syscall, csr_num, csr_wmask, csr_wdata} = mem_wb_csr_bus[81:0];
@@ -62,7 +69,6 @@ csr u_csr (
     .resetn     (resetn),
     .hw_int_in  (hw_int_in),
     .has_int    (has_int),
-    .current_plv(current_plv),
     .stable_counter(stable_counter),
     .csr_num    (csr_num),
     .csr_rdata  (csr_rdata),
@@ -71,7 +77,8 @@ csr u_csr (
     .csr_wdata  (csr_wdata),
     .wb_ex      (wb_ex),
     .wb_pc      (mem_wb_pc),
-    .wb_ecode   (mem_wb_ex_bus[37:32]),
+    .wb_ecode   (wb_ecode),
+    .wb_esubcode(wb_esubcode),
     .wb_badv    (mem_wb_ex_bus[31:0]),
     .ertn_flush (ertn_flush),
     .ex_entry   (ex_entry),
@@ -97,9 +104,7 @@ wire [31:0] load_result = (mem_wb_mem_size == 2'b00) ?
 // WB 写回同时作为 ID 的相关检测依据；r0 和复位不产生写回。
 assign rf_we    = resetn && !flush && mem_wb_gr_we && mem_wb_valid && (mem_wb_dest != 5'd0);
 assign rf_waddr = mem_wb_dest;
-assign rf_wdata = mem_wb_csr_bus[83] ? stable_counter[63:32] :
-                 mem_wb_csr_bus[82] ? stable_counter[31:0] :
-                 csr_re ? csr_rdata :
+assign rf_wdata = csr_re ? csr_rdata :
                  mem_wb_res_from_mem ? load_result : mem_wb_alu_result;
 
 // 调试信号与实际寄存器堆写端口保持对应
