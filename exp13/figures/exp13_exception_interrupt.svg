@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1180" viewBox="0 0 1600 1180">
+<rect width="100%" height="100%" fill="white"/>
+<text x="800" y="54" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="34" font-weight="700" text-anchor="middle">exp13 新增异常与中断处理结构</text>
+<text x="800" y="90" fill="#687785" font-family="Microsoft YaHei, sans-serif" font-size="20" font-weight="400" text-anchor="middle">按当前源码 d012558 绘制 · 省略普通指令数据通路</text>
+<rect x="70" y="120" width="320" height="105" rx="12" fill="#f1f8f5" stroke="#37756b" stroke-width="2"/>
+<text x="90" y="159" fill="#37756b" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">软件中断（2 路）</text>
+<text x="90" y="197" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">写 ESTAT.IS[1:0]</text>
+<rect x="640" y="120" width="320" height="105" rx="12" fill="#f1f8f5" stroke="#37756b" stroke-width="2"/>
+<text x="660" y="159" fill="#37756b" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">硬件中断（8 路）</text>
+<text x="660" y="197" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">hw_int_in → IS[9:2]</text>
+<rect x="1210" y="120" width="320" height="105" rx="12" fill="#f1f8f5" stroke="#37756b" stroke-width="2"/>
+<text x="1230" y="159" fill="#37756b" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">定时器中断</text>
+<text x="1230" y="197" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">TCFG / TVAL → IS[11]</text>
+<polyline points="230,225 230,247 610,247 610,275" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="610,275 605.2153791247765,265.0950818741206 614.7846208752235,265.0950818741206" fill="#49667f"/>
+<polyline points="800,225 800,275" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="800,275 795.2153791247765,265.0950818741206 804.7846208752235,265.0950818741206" fill="#49667f"/>
+<polyline points="1370,225 1370,247 990,247 990,275" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="990,275 985.2153791247765,265.0950818741206 994.7846208752235,265.0950818741206" fill="#49667f"/>
+<rect x="510" y="275" width="580" height="125" rx="12" fill="#f1f8f5" stroke="#37756b" stroke-width="2"/>
+<text x="530" y="314" fill="#37756b" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">CSR：中断状态与屏蔽</text>
+<text x="530" y="351" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">has_int = CRMD.IE &amp;&amp; |(ECFG.LIE &amp; IS)</text>
+<text x="530" y="383" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">定时器到期置位；TICLR 写 1 清除</text>
+<rect x="40" y="300" width="340" height="100" rx="12" fill="#f2f7fc" stroke="#3168a0" stroke-width="2"/>
+<text x="60" y="339" fill="#3168a0" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">IF：取指请求检查</text>
+<text x="60" y="377" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">未对齐 PC 不发出 SRAM 请求</text>
+<polyline points="200,400 200,505" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="200,505 195.21537912477646,495.0950818741206 204.78462087522354,495.0950818741206" fill="#49667f"/>
+<text x="215" y="458" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="19" font-weight="400" text-anchor="start">错误 PC</text>
+<polyline points="650,400 650,460 310,460 310,505" fill="none" stroke="#37756b" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="310,505 305.21537912477646,495.0950818741206 314.78462087522354,495.0950818741206" fill="#37756b"/>
+<text x="445" y="447" fill="#37756b" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">has_int</text>
+<rect x="40" y="505" width="320" height="150" rx="12" fill="#f2f7fc" stroke="#3168a0" stroke-width="2"/>
+<text x="60" y="544" fill="#3168a0" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">ID：生成异常标志</text>
+<text x="60" y="582" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">INT、ADEF、BRK、INE</text>
+<text x="60" y="614" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">SYS 沿用 exp12</text>
+<text x="60" y="646" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">初始地址字段 = 指令 PC</text>
+<rect x="440" y="505" width="320" height="150" rx="12" fill="#f2f7fc" stroke="#3168a0" stroke-width="2"/>
+<text x="460" y="544" fill="#3168a0" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">EX：检查访存对齐</text>
+<text x="460" y="582" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">字 / 半字不对齐 → ALE</text>
+<text x="460" y="614" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">补入 ALE 和有效地址</text>
+<text x="460" y="646" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">取消异常访存及写回</text>
+<rect x="840" y="505" width="320" height="150" rx="12" fill="#f2f7fc" stroke="#3168a0" stroke-width="2"/>
+<text x="860" y="544" fill="#3168a0" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">MEM：传递异常信息</text>
+<text x="860" y="582" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">标志、地址、PC 同步保存</text>
+<text x="860" y="614" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">flush 当拍禁止 SRAM 访问</text>
+<rect x="1240" y="505" width="320" height="150" rx="12" fill="#f2f7fc" stroke="#3168a0" stroke-width="2"/>
+<text x="1260" y="544" fill="#3168a0" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">WB：统一提交异常</text>
+<text x="1260" y="582" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">valid &amp;&amp; |flags → wb_ex</text>
+<text x="1260" y="614" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">按优先级生成 Ecode</text>
+<text x="1260" y="646" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">异常优先于 ertn</text>
+<polyline points="360,585 440,585" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="440,585 430.0950818741206,589.7846208752235 430.0950818741206,580.2153791247765" fill="#49667f"/>
+<polyline points="760,585 840,585" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="840,585 830.0950818741205,589.7846208752235 830.0950818741205,580.2153791247765" fill="#49667f"/>
+<polyline points="1160,585 1240,585" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="1240,585 1230.0950818741205,589.7846208752235 1230.0950818741205,580.2153791247765" fill="#49667f"/>
+<text x="800" y="701" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="middle">级间异常总线：38 位 = 6 位异常标志 + 32 位 BADV / PC（指令 PC、valid 另行传递）</text>
+<polyline points="1480,655 1480,830" fill="none" stroke="#49667f" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="1480,830 1475.2153791247765,820.0950818741205 1484.7846208752235,820.0950818741205" fill="#49667f"/>
+<text x="1492" y="758" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="18" font-weight="400" text-anchor="start">状态</text>
+<text x="1492" y="786" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="18" font-weight="400" text-anchor="start">提交</text>
+<polyline points="1320,655 1320,735 320,735 320,830" fill="none" stroke="#b06632" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="320,830 315.21537912477646,820.0950818741205 324.78462087522354,820.0950818741205" fill="#b06632"/>
+<text x="610" y="765" fill="#b06632" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="start">wb_ex / ertn_flush</text>
+<rect x="1080" y="830" width="480" height="215" rx="12" fill="#f1f8f5" stroke="#37756b" stroke-width="2"/>
+<text x="1100" y="869" fill="#37756b" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">CSR：保存与恢复状态</text>
+<text x="1100" y="906" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">ERA ← 异常指令 PC；ESTAT ← 编码</text>
+<text x="1100" y="938" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">ADEF / ALE：BADV ← 错误地址</text>
+<text x="1100" y="970" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">PRMD ← 原 PLV、IE；CRMD 清零两域</text>
+<text x="1100" y="1002" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">ertn：从 PRMD 恢复 PLV、IE</text>
+<rect x="40" y="830" width="560" height="215" rx="12" fill="#fff8f0" stroke="#b06632" stroke-width="2"/>
+<text x="60" y="869" fill="#b06632" font-family="Microsoft YaHei, sans-serif" font-size="24" font-weight="700" text-anchor="start">WB 冲刷与取指重定向</text>
+<text x="60" y="906" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">flush = wb_ex || ertn_flush</text>
+<text x="60" y="938" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">flush_pc = 异常 ? EENTRY : ERA</text>
+<text x="60" y="970" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">清各级 valid，禁止普通写回，取消除法</text>
+<text x="60" y="1002" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="start">异常 / 返回重定向优先于分支和停顿</text>
+<polyline points="1080,920 600,920" fill="none" stroke="#37756b" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="600,920 609.9049181258795,915.2153791247765 609.9049181258795,924.7846208752235" fill="#37756b"/>
+<text x="840" y="902" fill="#37756b" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="400" text-anchor="middle">EENTRY / ERA</text>
+<polyline points="40,945 15,945 15,350 40,350" fill="none" stroke="#b06632" stroke-width="2.3" stroke-linejoin="round"/>
+<polygon points="40,350 30.095081874120552,354.78462087522354 30.095081874120552,345.21537912477646" fill="#b06632"/>
+<text x="800" y="1102" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="22" font-weight="700" text-anchor="middle">flags[5:0] = { INT, ADEF, ALE, SYS, BRK, INE }</text>
+<text x="800" y="1141" fill="#243447" font-family="Microsoft YaHei, sans-serif" font-size="21" font-weight="400" text-anchor="middle">WB 编码优先级：INT &gt; ADEF &gt; ALE &gt; SYS &gt; BRK &gt; INE</text>
+</svg>
