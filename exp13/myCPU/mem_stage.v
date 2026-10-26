@@ -55,14 +55,14 @@ module mem_stage (
 );
 // load 和 CSR 结果都在 WB 可用；不能把它们的 ALU 结果误当前递数据。
 assign mem_pending_we   = resetn && !flush && ex_mem_valid && ex_mem_gr_we &&
-                          (ex_mem_res_from_mem || ex_mem_csr_bus[81] || ex_mem_csr_bus[80]) &&
+                          (ex_mem_res_from_mem || (|ex_mem_csr_bus[83:81])) &&
                           (ex_mem_dest != 5'd0);
 assign mem_pending_dest = ex_mem_dest;
 
 // 当前指令位于 MEM 阶段时，普通运算指令的 ALU 结果已经稳定，
 // 可以绕过寄存器堆，直接送回 ID 阶段解决数据相关。
 assign mem_forward_we   = resetn && !flush && ex_mem_valid && ex_mem_gr_we &&
-                          !ex_mem_res_from_mem && !ex_mem_csr_bus[81] && !ex_mem_csr_bus[80] &&
+                          !ex_mem_res_from_mem && !(|ex_mem_csr_bus[83:81]) &&
                           (ex_mem_dest != 5'd0);
 assign mem_forward_dest = ex_mem_dest;
 assign mem_forward_data = ex_mem_alu_result;

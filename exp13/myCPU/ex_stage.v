@@ -64,7 +64,7 @@ wire [31:0]  ex_result = is_div
 // complete 属于已启动的这条指令；不能让下一条除法消费旧完成标志。
 assign allow_in = !id_ex_valid || !is_div || (div_started && div_complete);
 assign ex_pending_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
-                         (id_ex_res_from_mem || id_ex_csr_bus[81] || id_ex_csr_bus[80] ||
+                         (id_ex_res_from_mem || (|id_ex_csr_bus[83:81]) ||
                           (is_div && !div_complete)) &&
                          (id_ex_dest != 5'd0);
 assign ex_pending_dest = id_ex_dest;
@@ -106,7 +106,7 @@ always @(posedge clk) begin
 end
 
 assign ex_forward_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
-                         !id_ex_res_from_mem && !id_ex_csr_bus[81] && !id_ex_csr_bus[80] &&
+                         !id_ex_res_from_mem && !(|id_ex_csr_bus[83:81]) &&
                          !ex_exception && allow_in &&
                          (id_ex_dest != 5'd0);
 assign ex_forward_dest = id_ex_dest;

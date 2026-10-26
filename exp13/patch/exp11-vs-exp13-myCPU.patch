@@ -1,0 +1,908 @@
+diff --git "a/exp13\\myCPU/csr.v" "b/exp13\\myCPU/csr.v"
+new file mode 100644
+index 0000000..05921fe
+--- /dev/null
++++ "b/exp13\\myCPU/csr.v"
+@@ -0,0 +1,232 @@
++`include "csr_defs.vh"
++
++// 控制状态寄存器集中管理；指令访问和异常硬件更新均在 WB 提交。
++// 保留位读零且不可写，未实现地址读零、忽略写入。
++module csr (
++    input  wire        clk,
++    input  wire        resetn,
++    input  wire [7:0]  hw_int_in,
++    output wire        has_int,
++    output reg  [63:0] stable_counter,
++    input  wire [13:0] csr_num,
++    output reg  [31:0] csr_rdata,
++    input  wire        csr_we,
++    input  wire [31:0] csr_wmask,
++    input  wire [31:0] csr_wdata,
++    input  wire        wb_ex,
++    input  wire [31:0] wb_pc,
++    input  wire [5:0]  wb_ecode,
++    input  wire [8:0]  wb_esubcode,
++    input  wire [31:0] wb_badv,
++    input  wire        ertn_flush,
++    output wire [31:0] ex_entry,
++    output wire [31:0] ex_era
++);
++
++// 本阶段尚无 MMU/Cache：DA=1，PG/DATF/DATM=0；仅 PLV、IE 可写。
++reg [1:0] crmd_plv;
++reg       crmd_ie;
++reg [1:0] prmd_pplv;
++reg       prmd_pie;
++reg [1:0] estat_sw;
++reg [5:0] estat_ecode;
++reg [8:0] estat_esubcode;
++reg [31:0] era;
++reg [25:0] eentry_va;
++reg [31:0] save0, save1, save2, save3;
++
++wire [31:0] masked_value = (csr_wmask & csr_wdata) |
++                           (~csr_wmask & csr_rdata);
++assign ex_entry = {eentry_va, 6'b0};
++assign ex_era = era;
++
++reg [12:0] ecfg_lie;
++reg [7:0]  estat_hw;
++reg        estat_timer;
++reg [31:0] badv;
++reg [31:0] tid;
++reg        tcfg_en;
++reg        tcfg_periodic;
++reg [29:0] tcfg_initval;
++reg [31:0] timer_value;
++
++wire [12:0] interrupt_status = {1'b0, estat_timer, 1'b0, estat_hw, estat_sw};
++wire [31:0] tcfg_value = {tcfg_initval, tcfg_periodic, tcfg_en};
++wire        write_tcfg = csr_we && csr_num == `CSR_TCFG;
++assign has_int = crmd_ie && (|(ecfg_lie & interrupt_status));
++
++always @(*) begin
++    case (csr_num)
++        `CSR_CRMD:   csr_rdata = {28'b0, 1'b1, crmd_ie, crmd_plv};
++        `CSR_PRMD:   csr_rdata = {29'b0, prmd_pie, prmd_pplv};
++        `CSR_ESTAT:  csr_rdata = {1'b0, estat_esubcode, estat_ecode,
++                                3'b0, interrupt_status};
++        `CSR_ERA:    csr_rdata = era;
++        `CSR_EENTRY: csr_rdata = ex_entry;
++        `CSR_SAVE0:  csr_rdata = save0;
++        `CSR_SAVE1:  csr_rdata = save1;
++        `CSR_SAVE2:  csr_rdata = save2;
++        `CSR_SAVE3:  csr_rdata = save3;
++        `CSR_ECFG:   csr_rdata = {19'b0, ecfg_lie};
++        `CSR_BADV:   csr_rdata = badv;
++        `CSR_TID:    csr_rdata = tid;
++        `CSR_TCFG:   csr_rdata = tcfg_value;
++        `CSR_TVAL:   csr_rdata = timer_value;
++        `CSR_TICLR:  csr_rdata = 32'b0;
++        default:     csr_rdata = 32'b0;
++    endcase
++end
++
++// CRMD：异常入口保存前状态并关闭中断，ertn 恢复 PLV/IE。
++always @(posedge clk) begin
++    if (!resetn) begin
++        crmd_plv <= 2'b0;
++        crmd_ie <= 1'b0;
++    end else if (wb_ex) begin
++        crmd_plv <= 2'b0;
++        crmd_ie <= 1'b0;
++    end else if (ertn_flush) begin
++        crmd_plv <= prmd_pplv;
++        crmd_ie <= prmd_pie;
++    end else if (csr_we && csr_num == `CSR_CRMD) begin
++        crmd_plv <= masked_value[1:0];
++        crmd_ie <= masked_value[2];
++    end
++end
++
++// 稳定计数器不受流水线停顿影响，每个时钟周期递增一次。
++always @(posedge clk) begin
++    if (!resetn)
++        stable_counter <= 64'b0;
++    else
++        stable_counter <= stable_counter + 64'd1;
++end
++
++always @(posedge clk) begin
++    if (!resetn) begin
++        prmd_pplv <= 2'b0;
++        prmd_pie <= 1'b0;
++    end else if (wb_ex) begin
++        prmd_pplv <= crmd_plv;
++        prmd_pie <= crmd_ie;
++    end else if (csr_we && csr_num == `CSR_PRMD) begin
++        prmd_pplv <= masked_value[1:0];
++        prmd_pie <= masked_value[2];
++    end
++end
++
++// 软件中断位可写；异常编码由硬件更新，CSR 写不能修改。
++always @(posedge clk) begin
++    if (!resetn)
++        estat_sw <= 2'b0;
++    else if (csr_we && csr_num == `CSR_ESTAT)
++        estat_sw <= masked_value[1:0];
++end
++
++always @(posedge clk) begin
++    if (!resetn)
++        era <= 32'b0;
++    else if (wb_ex)
++        // 保存异常指令自身 PC；是否跳过该指令由处理程序决定。
++        era <= wb_pc;
++    else if (csr_we && csr_num == `CSR_ERA)
++        era <= masked_value;
++end
++
++always @(posedge clk) begin
++    if (!resetn)
++        eentry_va <= 26'b0;
++    else if (csr_we && csr_num == `CSR_EENTRY)
++        eentry_va <= masked_value[31:6];
++end
++
++always @(posedge clk) begin
++    if (!resetn) begin
++        save0 <= 32'b0;
++        save1 <= 32'b0;
++        save2 <= 32'b0;
++        save3 <= 32'b0;
++    end else if (csr_we) begin
++        case (csr_num)
++            `CSR_SAVE0: save0 <= masked_value;
++            `CSR_SAVE1: save1 <= masked_value;
++            `CSR_SAVE2: save2 <= masked_value;
++            `CSR_SAVE3: save3 <= masked_value;
++            default: begin end
++        endcase
++    end
++end
++
++always @(posedge clk) begin
++    if (!resetn) begin
++        estat_ecode <= 6'b0;
++        estat_esubcode <= 9'b0;
++    end else if (wb_ex) begin
++        estat_ecode <= wb_ecode;
++        estat_esubcode <= wb_esubcode;
++    end
++end
++
++// BADV 的硬件更新优先于软件写；非地址异常保持原值。
++always @(posedge clk) begin
++    if (!resetn)
++        badv <= 32'b0;
++    else if (wb_ex && ((wb_ecode == `ECODE_ADE && wb_esubcode == `ESUBCODE_ADEF) ||
++                       wb_ecode == `ECODE_ALE))
++        badv <= wb_badv;
++    else if (csr_we && csr_num == `CSR_BADV)
++        badv <= masked_value;
++end
++
++always @(posedge clk) begin
++    if (!resetn) begin
++        ecfg_lie <= 13'b0;
++        tid <= 32'b0;
++        estat_hw <= 8'b0;
++    end else begin
++        // 硬件中断在 CPU 时钟域采样；未实现的 IS[10]/IS[12] 恒零。
++        estat_hw <= hw_int_in;
++        if (csr_we && csr_num == `CSR_ECFG)
++            ecfg_lie <= masked_value[12:0] & 13'h1bff;
++        if (csr_we && csr_num == `CSR_TID)
++            tid <= masked_value;
++    end
++end
++
++// 配置字段与倒计数器分开维护。单次到期不清 En，TVAL 全 1 表示停止。
++always @(posedge clk) begin
++    if (!resetn) begin
++        tcfg_en <= 1'b0;
++        tcfg_periodic <= 1'b0;
++        tcfg_initval <= 30'b0;
++    end else if (write_tcfg) begin
++        tcfg_en <= masked_value[0];
++        tcfg_periodic <= masked_value[1];
++        tcfg_initval <= masked_value[31:2];
++    end
++end
++
++always @(posedge clk) begin
++    if (!resetn)
++        timer_value <= 32'hffff_ffff;
++    else if (write_tcfg && masked_value[0])
++        timer_value <= {masked_value[31:2], 2'b0};
++    else if (tcfg_en && timer_value != 32'hffff_ffff) begin
++        if (timer_value == 32'b0 && tcfg_periodic)
++            timer_value <= {tcfg_initval, 2'b0};
++        else
++            timer_value <= timer_value - 32'd1;
++    end
++end
++
++// 到期与 TICLR 写一清除同拍时到期优先；关闭定时器不清中断状态。
++always @(posedge clk) begin
++    if (!resetn)
++        estat_timer <= 1'b0;
++    else if (tcfg_en && timer_value == 32'b0)
++        estat_timer <= 1'b1;
++    else if (csr_we && csr_num == `CSR_TICLR && csr_wmask[0] && csr_wdata[0])
++        estat_timer <= 1'b0;
++end
++
++endmodule
+diff --git "a/exp13\\myCPU/csr_defs.vh" "b/exp13\\myCPU/csr_defs.vh"
+new file mode 100644
+index 0000000..0f053fd
+--- /dev/null
++++ "b/exp13\\myCPU/csr_defs.vh"
+@@ -0,0 +1,46 @@
++// CSR 编号和异常标志集中定义，流水总线不再依赖散落的数字位号。
++`ifndef MYCPU_CSR_DEFS_VH
++`define MYCPU_CSR_DEFS_VH
++
++`define CSR_CRMD      14'h0000
++`define CSR_PRMD      14'h0001
++`define CSR_ECFG      14'h0004
++`define CSR_ESTAT     14'h0005
++`define CSR_ERA       14'h0006
++`define CSR_BADV      14'h0007
++`define CSR_EENTRY    14'h000c
++`define CSR_SAVE0     14'h0030
++`define CSR_SAVE1     14'h0031
++`define CSR_SAVE2     14'h0032
++`define CSR_SAVE3     14'h0033
++`define CSR_TID       14'h0040
++`define CSR_TCFG      14'h0041
++`define CSR_TVAL      14'h0042
++`define CSR_TICLR     14'h0044
++
++// {csr_re, csr_we, ertn, syscall, csr_num[13:0], wmask[31:0], wdata[31:0]}
++`define CSR_BUS_WD    82
++`define CSR_BUS_RE    81
++`define CSR_BUS_WE    80
++`define CSR_BUS_ERTN  79
++
++// 异常逐项携带到 WB，再按优先级编码；总线为 {flags[5:0], badv/pc}。
++`define EX_FLAGS_WD   6
++`define EX_BUS_WD     38
++`define EX_INT        5
++`define EX_ADEF       4
++`define EX_ALE        3
++`define EX_SYS        2
++`define EX_BRK        1
++`define EX_INE        0
++
++`define ECODE_INT     6'h00
++`define ECODE_ADE     6'h08
++`define ECODE_ALE     6'h09
++`define ECODE_SYS     6'h0b
++`define ECODE_BRK     6'h0c
++`define ECODE_INE     6'h0d
++`define ESUBCODE_ADEF 9'b0
++
++`endif
++
+diff --git "a/exp11\\myCPU/ex_stage.v" "b/exp13\\myCPU/ex_stage.v"
+index 8196e2f..9847943 100644
+--- "a/exp11\\myCPU/ex_stage.v"
++++ "b/exp13\\myCPU/ex_stage.v"
+@@ -4,6 +4,7 @@ module ex_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
++    input  wire         flush,
+ 
+     // 来自 ID/EX 的操作数与控制信号
+     input  wire         id_ex_valid,
+@@ -20,12 +21,14 @@ module ex_stage (
+     input  wire         id_ex_load_unsigned,
+     input  wire         id_ex_gr_we,
+     input  wire [4:0]   id_ex_dest,
++    input  wire [83:0]  id_ex_csr_bus,
++    input  wire [37:0]  id_ex_ex_bus,
+ 
+     // 除法未完成时阻止 ID/EX 接收下一条指令。
+     output wire         allow_in,
+ 
+     // 当前 EX 指令的相关信息反馈给 ID。
+-    // 算术/逻辑结果可直接前递；load 结果尚未返回，需要停顿。
++    // 算术/逻辑结果可直接前递；load 和 CSR 结果需等待 WB。
+     output wire         ex_pending_we,
+     output wire [4:0]   ex_pending_dest,
+     output wire         ex_forward_we,
+@@ -42,7 +45,9 @@ module ex_stage (
+     output reg  [1:0]   ex_mem_mem_size,
+     output reg          ex_mem_load_unsigned,
+     output reg          ex_mem_gr_we,
+-    output reg  [4:0]   ex_mem_dest
++    output reg  [4:0]   ex_mem_dest,
++    output reg  [83:0]  ex_mem_csr_bus,
++    output reg  [37:0]  ex_mem_ex_bus
+ );
+ // ALU 操作数选择：PC 或寄存器值，立即数或第二个寄存器值
+ wire [31:0]  alu_result;
+@@ -58,12 +63,18 @@ wire [31:0]  ex_result = is_div
+ 
+ // complete 属于已启动的这条指令；不能让下一条除法消费旧完成标志。
+ assign allow_in = !id_ex_valid || !is_div || (div_started && div_complete);
+-assign ex_pending_we   = resetn && id_ex_valid && id_ex_gr_we &&
+-                         (id_ex_res_from_mem || (is_div && !div_complete)) &&
++assign ex_pending_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
++                         (id_ex_res_from_mem || id_ex_csr_bus[81] || id_ex_csr_bus[80] ||
++                          (is_div && !div_complete)) &&
+                          (id_ex_dest != 5'd0);
+ assign ex_pending_dest = id_ex_dest;
+ wire [31:0]  alu_src1 = id_ex_src1_is_pc ? id_ex_pc : id_ex_rj_value;
+ wire [31:0]  alu_src2 = id_ex_src2_is_imm ? id_ex_imm : id_ex_rkd_value;
++// 在发出数据 SRAM 请求之前检查地址对齐。字节访问始终对齐。
++wire ale = (id_ex_res_from_mem || id_ex_mem_we) &&
++           (((id_ex_mem_size == 2'b10) && (|alu_result[1:0])) ||
++            ((id_ex_mem_size == 2'b01) && alu_result[0]));
++wire ex_exception = (|id_ex_ex_bus[37:32]) || ale;
+ 
+ alu u_alu (
+     .alu_op     (id_ex_alu_op),
+@@ -73,9 +84,10 @@ alu u_alu (
+ );
+ 
+ divider u_divider (
++    // 同步取消被异常冲刷的除法，避免旧 complete 污染处理程序中的除法。
+     .clk       (clk),
+-    .resetn    (resetn),
+-    .start     (resetn && id_ex_valid && is_div && !div_started),
++    .resetn    (resetn && !flush),
++    .start     (resetn && !flush && id_ex_valid && is_div && !div_started),
+     .is_signed (id_ex_alu_op[15] | id_ex_alu_op[16]),
+     .dividend  (id_ex_rj_value),
+     .divisor   (id_ex_rkd_value),
+@@ -85,7 +97,7 @@ divider u_divider (
+ );
+ 
+ always @(posedge clk) begin
+-    if (!resetn)
++    if (!resetn || flush)
+         div_started <= 1'b0;
+     else if (id_ex_valid && is_div && !div_started)
+         div_started <= 1'b1;
+@@ -93,8 +105,9 @@ always @(posedge clk) begin
+         div_started <= 1'b0;
+ end
+ 
+-assign ex_forward_we   = resetn && id_ex_valid && id_ex_gr_we &&
+-                         !id_ex_res_from_mem && allow_in &&
++assign ex_forward_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
++                         !id_ex_res_from_mem && !id_ex_csr_bus[81] && !id_ex_csr_bus[80] &&
++                         !ex_exception && allow_in &&
+                          (id_ex_dest != 5'd0);
+ assign ex_forward_dest = id_ex_dest;
+ assign ex_forward_data = ex_result;
+@@ -102,19 +115,23 @@ assign ex_forward_data = ex_result;
+ // EX/MEM：ALU 结果用于算术写回或访存地址。
+ // store_data 直接传递第二个源寄存器值，不使用经过立即数选择的 alu_src2。
+ always @(posedge clk) begin
+-    if (~resetn)
++    if (~resetn || flush)
+         ex_mem_valid <= 1'b0;
+     else begin
+         ex_mem_valid        <= id_ex_valid && allow_in;
+         ex_mem_pc           <= id_ex_pc;
+         ex_mem_alu_result   <= ex_result;
+         ex_mem_store_data   <= id_ex_rkd_value;
+-        ex_mem_res_from_mem <= id_ex_res_from_mem;
+-        ex_mem_mem_we       <= id_ex_mem_we;
++        ex_mem_res_from_mem <= id_ex_res_from_mem && !ex_exception;
++        ex_mem_mem_we       <= id_ex_mem_we && !ex_exception;
+         ex_mem_mem_size     <= id_ex_mem_size;
+         ex_mem_load_unsigned <= id_ex_load_unsigned;
+-        ex_mem_gr_we        <= id_ex_gr_we;
++        ex_mem_gr_we        <= id_ex_gr_we && !ex_exception;
+         ex_mem_dest         <= id_ex_dest;
++        ex_mem_csr_bus      <= id_ex_csr_bus;
++        ex_mem_ex_bus       <= (|id_ex_ex_bus[37:32]) ? id_ex_ex_bus :
++                               {ale ? 6'b001000 : 6'b0,
++                                ale ? alu_result : id_ex_ex_bus[31:0]};
+     end
+ end
+ 
+diff --git "a/exp11\\myCPU/id_stage.v" "b/exp13\\myCPU/id_stage.v"
+index 698940b..2d850c2 100644
+--- "a/exp11\\myCPU/id_stage.v"
++++ "b/exp13\\myCPU/id_stage.v"
+@@ -1,10 +1,15 @@
+ 
++`include "csr_defs.vh"
++
+ // ID：指令译码、寄存器堆读写、立即数生成和分支判断。
+ // 译码结果和操作数在时钟上升沿一起进入 ID/EX 流水寄存器。
+ module id_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
++    input  wire         flush,
++    input  wire         has_int,
++    input  wire         csr_pending,
+ 
+     // 来自 IF/ID 的指令与 PC
+     input  wire         if_id_valid,
+@@ -16,7 +21,7 @@ module id_stage (
+     input  wire [4:0]   rf_waddr,
+     input  wire [31:0]  rf_wdata,
+ 
+-    // EX/MEM 中尚未写回的 load 目的寄存器，用于 load-use 相关检测。
++    // EX/MEM 中尚未就绪的 load、CSR 等结果，用于数据相关检测。
+     input  wire         ex_pending_we,
+     input  wire [4:0]   ex_pending_dest,
+     input  wire         mem_pending_we,
+@@ -30,8 +35,8 @@ module id_stage (
+     input  wire [31:0]  mem_forward_data,
+     // EX 除法未完成时保持 ID/EX，不能覆盖当前除法指令。
+     input  wire         ex_allow_in,
+-    // 无 load-use 相关且 EX 可以接收新指令时为 1。
+-    // 为 0 时冻结 IF；仅 load-use 停顿向 EX 注入气泡。
++    // 无数据相关、无冲刷且 EX 可以接收新指令时为 1。
++    // 数据相关时冻结 IF 并向 EX 注入气泡；EX 忙时保持 ID/EX。
+     output wire         ready_go,
+ 
+     // 反馈给 IF 的分支结果（组合逻辑）
+@@ -52,7 +57,13 @@ module id_stage (
+     output reg  [1:0]   id_ex_mem_size,
+     output reg          id_ex_load_unsigned,
+     output reg          id_ex_gr_we,
+-    output reg  [4:0]   id_ex_dest
++    output reg  [4:0]   id_ex_dest,
++    // [81:78]: CSR读、CSR写、ertn、syscall；[77:64]: CSR编号；
++    // [63:32]: 写掩码；[31:0]: 写数据。随指令传到 WB 提交。
++    // [83:82]: {rdcntvh, rdcntvl}，其余位保持 exp12 布局。
++    output reg  [83:0]  id_ex_csr_bus,
++    // {异常标志[5:0], BADV/PC[31:0]}，异常编码在 WB 再统一生成。
++    output reg  [37:0]  id_ex_ex_bus
+ );
+ 
+ // 指令字段提取
+@@ -128,7 +139,7 @@ wire         inst_bge       = op_31_26_d[25];
+ wire         inst_bltu      = op_31_26_d[26];
+ wire         inst_bgeu      = op_31_26_d[27];
+ wire         inst_lu12i_w   = op_31_26_d[5] & ~inst[25];
+-wire         inst_pcaddu12i = op_31_26_d[7];
++wire         inst_pcaddu12i = op_31_26_d[7] & ~inst[25];
+ 
+ // exp10 新增的立即数、寄存器移位和乘除法指令。
+ wire         inst_slti     = op_31_26_d[0] & op_25_22_d[8];
+@@ -157,7 +168,20 @@ wire         inst_div_wu   = op_31_26_d[0] & op_25_22_d[0] &
+ wire         inst_mod_wu   = op_31_26_d[0] & op_25_22_d[0] &
+                              op_21_20_d[2] & op_19_15_d[3];
+ 
+-// ALU 控制位：各位含义与 alu.v 的 alu_op 接口一致
++// exp12：CSR 指令用 rj 字段区分读、写和掩码交换；syscall 的 code 不参与译码。
++wire         inst_csrrd   = (inst[31:24] == 8'h04) && (rj == 5'd0);
++wire         inst_csrwr   = (inst[31:24] == 8'h04) && (rj == 5'd1);
++wire         inst_csrxchg = (inst[31:24] == 8'h04) && (rj != 5'd0) && (rj != 5'd1);
++wire         inst_ertn    = (inst == 32'h0648_3800);
++wire         inst_syscall = (inst[31:15] == 17'h00056);
++wire         inst_break   = (inst[31:15] == 17'h00054);
++wire         inst_rdcntvl = (inst[31:10] == 22'h000018) && (rj == 5'd0);
++wire         inst_rdcntvh = (inst[31:10] == 22'h000019) && (rj == 5'd0);
++wire         inst_rdcntid = (inst[31:10] == 22'h000018) && (rd == 5'd0) && (rj != 5'd0);
++wire         csr_re       = inst_csrrd | inst_csrwr | inst_csrxchg | inst_rdcntid;
++wire         csr_we       = inst_csrwr | inst_csrxchg;
++
++// ALU 控制位：各位含义与 alu.v 的 alu_op 接口一致。
+ wire [18:0]  alu_op = {
+     inst_mod_wu,   // [18] 无符号取余
+     inst_div_wu,   // [17] 无符号除法
+@@ -188,7 +212,17 @@ wire         is_cond_branch = inst_beq | inst_bne | inst_blt | inst_bge |
+                               inst_bltu | inst_bgeu;
+ wire         is_load = inst_ld_w | inst_ld_b | inst_ld_h | inst_ld_bu | inst_ld_hu;
+ wire         is_store = inst_st_w | inst_st_b | inst_st_h;
+-wire         src_reg_is_rd = is_cond_branch | is_store;
++// 所有已支持指令的白名单，未命中的编码产生 INE，不能写入 rd。
++wire         inst_valid = (|alu_op) | is_cond_branch | inst_b | csr_re |
++                          inst_ertn | inst_syscall | inst_break |
++                          inst_rdcntvl | inst_rdcntvh;
++// ADEF 只表示取指地址未按 4 字节对齐；高地址本身不是本实验的 ADEF。
++wire         adef = |if_id_pc[1:0];
++// 各类异常独立下传，WB 再按 INT>ADEF>SYS>BRK>INE 的顺序编码 ECODE。
++wire [5:0]   id_ex_flags = {has_int, adef, 1'b0, inst_syscall,
++                            inst_break, !inst_valid};
++wire         id_exception = |id_ex_flags;
++wire         src_reg_is_rd = is_cond_branch | is_store | csr_we;
+ wire         src1_is_pc    = inst_jirl | inst_bl | inst_pcaddu12i;
+ wire         src2_is_imm   = inst_slli_w | inst_srli_w | inst_srai_w |
+                             inst_addi_w | is_load | is_store |
+@@ -211,14 +245,15 @@ wire [31:0]  jirl_offs = {{14{i16[15]}}, i16, 2'b0};
+ // 后续阶段控制：访存结果选择、存储使能、通用寄存器写使能
+ wire         res_from_mem = is_load,
+              mem_we = is_store,
+-             gr_we = ~is_store & ~is_cond_branch & ~inst_b;
++             gr_we = inst_valid & ~is_store & ~is_cond_branch & ~inst_b &
++                     ~inst_ertn & ~id_exception;
+ // 00：字节，01：半字，10：字；无符号标志仅对 load 有意义。
+ wire [1:0]   mem_size = (inst_ld_b | inst_ld_bu | inst_st_b) ? 2'b00 :
+                         (inst_ld_h | inst_ld_hu | inst_st_h) ? 2'b01 : 2'b10;
+ wire         load_unsigned = inst_ld_bu | inst_ld_hu;
+ 
+ // bl 写入 r1；其余指令的目的寄存器来自 rd
+-wire [4:0]   dest      = inst_bl ? 5'd1 : rd;
++wire [4:0]   dest      = inst_bl ? 5'd1 : inst_rdcntid ? rj : rd;
+ wire [4:0]   rf_raddr2 = src_reg_is_rd ? rd : rk;
+ 
+ // 寄存器堆读数据及分支比较
+@@ -254,15 +289,15 @@ wire use_rj = inst_add_w | inst_sub_w | inst_slt | inst_sltu |
+               inst_slti | inst_sltui | inst_andi | inst_ori | inst_xori |
+               inst_mul_w | inst_mulh_w | inst_mulh_wu |
+               inst_div_w | inst_mod_w | inst_div_wu | inst_mod_wu |
+-              is_load | is_store | inst_jirl | is_cond_branch;
++              is_load | is_store | inst_jirl | is_cond_branch | inst_csrxchg;
+ wire use_rkd = inst_add_w | inst_sub_w | inst_slt | inst_sltu |
+                inst_nor | inst_and | inst_or | inst_xor |
+                inst_sll_w | inst_srl_w | inst_sra_w |
+                inst_mul_w | inst_mulh_w | inst_mulh_wu |
+                inst_div_w | inst_mod_w | inst_div_wu | inst_mod_wu |
+-               is_store | is_cond_branch;
++               is_store | is_cond_branch | csr_we;
+ 
+-// 只有 load 结果不能在当前周期前递，故 EX/MEM 中的 load 才会阻塞。
++// load 和 CSR 读结果都到 WB 才可用，EX/MEM 中的这些指令需要阻塞。
+ // ALU 结果从 EX、EX/MEM 前递，WB 结果从写回端口前递；r0 恒为零。
+ // 存储数据和分支操作数也必须检查。
+ wire hazard_rj = use_rj && (rj != 5'd0) &&
+@@ -271,8 +306,10 @@ wire hazard_rj = use_rj && (rj != 5'd0) &&
+ wire hazard_rkd = use_rkd && (rf_raddr2 != 5'd0) &&
+                   ((ex_pending_we  && ex_pending_dest  == rf_raddr2) ||
+                    (mem_pending_we && mem_pending_dest == rf_raddr2));
+-assign ready_go = ex_allow_in &&
+-                  !(resetn && if_id_valid && (hazard_rj || hazard_rkd));
++// 较早的 CSR 写必须先提交，才能按新 PLV/IE/ECFG/ESTAT 判断异常。
++// 异常指令无需等待普通操作数，但不能越过 EX 的较早指令。
++assign ready_go = !flush && ex_allow_in && !csr_pending &&
++                  !(resetn && if_id_valid && !id_exception && (hazard_rj || hazard_rkd));
+ 
+ // 寄存器堆：ID 提供读地址，WB 提供写使能、目的寄存器号和写回数据
+ regfile u_rf (
+@@ -293,14 +330,14 @@ assign br_taken = ((inst_beq & rj_eq_rd) |
+                    (inst_bge & ~rj_lt_rd) |
+                    (inst_bltu & rj_ltu_rd) |
+                    (inst_bgeu & ~rj_ltu_rd) |
+-                   inst_jirl | inst_bl | inst_b) & if_id_valid & ready_go & resetn;
++                   inst_jirl | inst_bl | inst_b) & if_id_valid & ready_go & resetn & ~id_exception;
+ assign br_target = (is_cond_branch | inst_bl | inst_b)
+                  ? if_id_pc + br_offs
+                  : rj_value + jirl_offs;
+ 
+ // ID/EX：操作数、目的寄存器号和控制位必须属于同一条指令。
+ always @(posedge clk) begin
+-    if (reset)
++    if (reset || flush)
+         id_ex_valid <= 1'b0;
+     else if (!ex_allow_in) begin
+         // EX 正在执行多周期除法，保持本级流水寄存器。
+@@ -313,15 +350,22 @@ always @(posedge clk) begin
+         id_ex_rj_value     <= rj_value;
+         id_ex_rkd_value    <= rkd_value;
+         id_ex_imm          <= imm;
+-        id_ex_alu_op       <= alu_op;
++        id_ex_alu_op       <= id_exception ? 19'b0 : alu_op;
+         id_ex_src1_is_pc   <= src1_is_pc;
+         id_ex_src2_is_imm  <= src2_is_imm;
+-        id_ex_res_from_mem <= res_from_mem;
+-        id_ex_mem_we       <= mem_we;
++        id_ex_res_from_mem <= res_from_mem && !id_exception;
++        id_ex_mem_we       <= mem_we && !id_exception;
+         id_ex_mem_size     <= mem_size;
+         id_ex_load_unsigned <= load_unsigned;
+         id_ex_gr_we        <= gr_we;
+         id_ex_dest         <= dest;
++        id_ex_ex_bus       <= {id_ex_flags, if_id_pc};
++        id_ex_csr_bus      <= {inst_rdcntvh, inst_rdcntvl,
++                               csr_re, csr_we && !id_exception,
++                               inst_ertn && !id_exception, inst_syscall,
++                               (inst_rdcntid ? 14'h0040 : inst[23:10]),
++                               (inst_csrwr ? 32'hffff_ffff : rj_value),
++                               rkd_value};
+     end
+ end
+ 
+diff --git "a/exp11\\myCPU/if_stage.v" "b/exp13\\myCPU/if_stage.v"
+index b7723b6..4c0d877 100644
+--- "a/exp11\\myCPU/if_stage.v"
++++ "b/exp13\\myCPU/if_stage.v"
+@@ -30,10 +30,13 @@ wire         reset = ~resetn;
+ 
+ // 顺序取指加 4；重定向时改用分支目标
+ wire [31:0]  next_pc = redirect_i ? redirect_pc_i : pc + 32'd4;
++// ADEF 只针对未按 4 字节对齐的取指地址。非法地址不发起 SRAM 请求，
++// 但仍把该 PC 作为异常流水项送入 ID，由 ID 产生精确异常标志。
++wire         next_pc_adef = |next_pc[1:0];
+ 
+ // 同步指令 RAM 使用 next_pc 发起读取；IF/ID 在时钟沿保存当前返回值
+ // ID 阻塞时同时冻结 RAM 输出和 PC，否则解除阻塞后指令与 PC 会错位。
+-assign inst_sram_en    = resetn && allow_in;
++assign inst_sram_en    = resetn && allow_in && !next_pc_adef;
+ assign inst_sram_we    = 4'b0;
+ assign inst_sram_addr  = next_pc;
+ assign inst_sram_wdata = 32'b0;
+diff --git "a/exp11\\myCPU/mem_stage.v" "b/exp13\\myCPU/mem_stage.v"
+index eb64aac..43ea454 100644
+--- "a/exp11\\myCPU/mem_stage.v"
++++ "b/exp13\\myCPU/mem_stage.v"
+@@ -5,6 +5,7 @@ module mem_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
++    input  wire         flush,
+ 
+     // 来自 EX/MEM 的地址、存储数据和控制信号
+     input  wire         ex_mem_valid,
+@@ -17,8 +18,10 @@ module mem_stage (
+     input  wire         ex_mem_load_unsigned,
+     input  wire         ex_mem_gr_we,
+     input  wire [4:0]   ex_mem_dest,
++    input  wire [83:0]  ex_mem_csr_bus,
++    input  wire [37:0]  ex_mem_ex_bus,
+ 
+-    // 当前 MEM 阶段 load 的写回意图，反馈给 ID 做相关检测。
++    // 当前 MEM 阶段 load/CSR 的写回意图，反馈给 ID 做相关检测。
+     output wire         mem_pending_we,
+     output wire [4:0]   mem_pending_dest,
+ 
+@@ -46,25 +49,29 @@ module mem_stage (
+     output reg          mem_wb_load_unsigned,
+     output reg  [1:0]   mem_wb_addr_low,
+     output reg          mem_wb_gr_we,
+-    output reg  [4:0]   mem_wb_dest
++    output reg  [4:0]   mem_wb_dest,
++    output reg  [83:0]  mem_wb_csr_bus,
++    output reg  [37:0]  mem_wb_ex_bus
+ );
+-// 只有 load 仍然需要等待数据返回；ALU 结果由本模块输出前递。
+-assign mem_pending_we   = resetn && ex_mem_valid && ex_mem_gr_we &&
+-                          ex_mem_res_from_mem && (ex_mem_dest != 5'd0);
++// load 和 CSR 结果都在 WB 可用；不能把它们的 ALU 结果误当前递数据。
++assign mem_pending_we   = resetn && !flush && ex_mem_valid && ex_mem_gr_we &&
++                          (ex_mem_res_from_mem || ex_mem_csr_bus[81] || ex_mem_csr_bus[80]) &&
++                          (ex_mem_dest != 5'd0);
+ assign mem_pending_dest = ex_mem_dest;
+ 
+-// 当前指令位于 MEM 阶段时，非 load 指令的 ALU 结果已经稳定，
++// 当前指令位于 MEM 阶段时，普通运算指令的 ALU 结果已经稳定，
+ // 可以绕过寄存器堆，直接送回 ID 阶段解决数据相关。
+-assign mem_forward_we   = resetn && ex_mem_valid && ex_mem_gr_we &&
+-                          !ex_mem_res_from_mem && (ex_mem_dest != 5'd0);
++assign mem_forward_we   = resetn && !flush && ex_mem_valid && ex_mem_gr_we &&
++                          !ex_mem_res_from_mem && !ex_mem_csr_bus[81] && !ex_mem_csr_bus[80] &&
++                          (ex_mem_dest != 5'd0);
+ assign mem_forward_dest = ex_mem_dest;
+ assign mem_forward_data = ex_mem_alu_result;
+ 
+-// 仅有效访存指令访问 SRAM；气泡和复位均不得产生存储副作用。
+-assign data_sram_en    = resetn && ex_mem_valid && (ex_mem_mem_we || ex_mem_res_from_mem);
++// WB 异常/ertn 冲刷时，MEM 指令比它年轻，必须在本拍就取消访存。
++assign data_sram_en    = resetn && !flush && ex_mem_valid && (ex_mem_mem_we || ex_mem_res_from_mem);
+ // RAM 是 32 位、4 路字节写使能。字节/半字存储只打开对应 lane，
+ // 写数据在相应 lane 复制，兼容 BRAM 和外设桥的 byte-enable 语义。
+-assign data_sram_we = !resetn || !ex_mem_valid || !ex_mem_mem_we ? 4'b0000 :
++assign data_sram_we = !resetn || flush || !ex_mem_valid || !ex_mem_mem_we ? 4'b0000 :
+                       (ex_mem_mem_size == 2'b00) ? (4'b0001 << ex_mem_alu_result[1:0]) :
+                       (ex_mem_mem_size == 2'b01) ? (ex_mem_alu_result[1] ? 4'b1100 : 4'b0011) :
+                                                    4'b1111;
+@@ -80,7 +87,7 @@ assign mem_wb_mem_result = data_sram_rdata;
+ // MEM/WB：传递 ALU 结果及对应的写回控制。
+ // 复位清除有效位，WB 通过该有效位禁止无效指令写寄存器。
+ always @(posedge clk) begin
+-    if (~resetn)
++    if (~resetn || flush)
+         mem_wb_valid <= 1'b0;
+     else begin
+         mem_wb_valid        <= ex_mem_valid;
+@@ -92,6 +99,8 @@ always @(posedge clk) begin
+         mem_wb_addr_low     <= ex_mem_alu_result[1:0];
+         mem_wb_gr_we        <= ex_mem_gr_we;
+         mem_wb_dest         <= ex_mem_dest;
++        mem_wb_csr_bus      <= ex_mem_csr_bus;
++        mem_wb_ex_bus       <= ex_mem_ex_bus;
+     end
+ end
+ 
+diff --git "a/exp11\\myCPU/mycpu_top.v" "b/exp13\\myCPU/mycpu_top.v"
+index b943242..6d761ee 100644
+--- "a/exp11\\myCPU/mycpu_top.v"
++++ "b/exp13\\myCPU/mycpu_top.v"
+@@ -5,6 +5,8 @@ module mycpu_top (
+     // 时钟与低有效复位
+     input  wire         clk,
+     input  wire         resetn,
++    // 八路高电平有效硬件中断；无外部中断源的 SoC 应连接 8'b0。
++    input  wire [7:0]   hw_int_in,
+ 
+     // 指令 SRAM 接口
+     output wire         inst_sram_en,
+@@ -95,13 +97,30 @@ wire         rf_we;
+ wire [4:0]   rf_waddr;
+ wire [31:0]  rf_wdata;
+ 
++// 特权指令控制随流水线传递；CSR 在 WB 读写，异常在 WB 精确提交。
++// 总线布局：{rdcntvh, rdcntvl, csr_re, csr_we, ertn, syscall,
++//            csr_num[13:0], wmask[31:0], wdata[31:0]}。
++wire [83:0]  id_ex_csr_bus;
++wire [83:0]  ex_mem_csr_bus;
++wire [83:0]  mem_wb_csr_bus;
++wire [37:0]  id_ex_ex_bus;
++wire [37:0]  ex_mem_ex_bus;
++wire [37:0]  mem_wb_ex_bus;
++wire         has_int;
++wire         csr_pending = (id_ex_valid && id_ex_csr_bus[80]) ||
++                           (ex_mem_valid && ex_mem_csr_bus[80]) ||
++                           (mem_wb_valid && mem_wb_csr_bus[80]);
++wire         flush;
++wire [31:0]  flush_pc;
++
+ // IF：PC、取指和 IF/ID 寄存器
+ if_stage u_if (
+-    .allow_in        (ready_go),
++    // 异常/返回必须越过 load-use 或除法造成的前端冻结。
++    .allow_in        (ready_go || flush),
+     .clk             (clk),
+     .resetn          (resetn),
+-    .redirect_i      (br_taken),
+-    .redirect_pc_i   (br_target),
++    .redirect_i      (flush || br_taken),
++    .redirect_pc_i   (flush ? flush_pc : br_target),
+     .inst_sram_rdata (inst_sram_rdata),
+     .inst_sram_en    (inst_sram_en),
+     .inst_sram_we    (inst_sram_we),
+@@ -114,6 +133,11 @@ if_stage u_if (
+ 
+ // ID：译码、寄存器堆、分支判断和 ID/EX 寄存器
+ id_stage u_id (
++    .has_int           (has_int),
++    .csr_pending       (csr_pending),
++    .id_ex_ex_bus      (id_ex_ex_bus),
++    .flush             (flush),
++    .id_ex_csr_bus     (id_ex_csr_bus),
+     .ex_pending_we      (ex_pending_we),
+     .ex_pending_dest    (ex_pending_dest),
+     .mem_pending_we     (mem_pending_we),
+@@ -154,6 +178,11 @@ id_stage u_id (
+ 
+ // EX：ALU 和 EX/MEM 寄存器
+ ex_stage u_ex (
++    .id_ex_ex_bus       (id_ex_ex_bus),
++    .ex_mem_ex_bus      (ex_mem_ex_bus),
++    .flush              (flush),
++    .id_ex_csr_bus      (id_ex_csr_bus),
++    .ex_mem_csr_bus     (ex_mem_csr_bus),
+     .allow_in            (ex_allow_in),
+     .ex_pending_we       (ex_pending_we),
+     .ex_pending_dest     (ex_pending_dest),
+@@ -190,6 +219,11 @@ ex_stage u_ex (
+ 
+ // MEM：数据 SRAM 接口和 MEM/WB 寄存器
+ mem_stage u_mem (
++    .ex_mem_ex_bus      (ex_mem_ex_bus),
++    .mem_wb_ex_bus      (mem_wb_ex_bus),
++    .flush              (flush),
++    .ex_mem_csr_bus     (ex_mem_csr_bus),
++    .mem_wb_csr_bus     (mem_wb_csr_bus),
+     .mem_pending_we      (mem_pending_we),
+     .mem_pending_dest    (mem_pending_dest),
+     .mem_forward_we      (mem_forward_we),
+@@ -226,6 +260,13 @@ mem_stage u_mem (
+ 
+ // WB：写回选择与调试输出
+ wb_stage u_wb (
++    .hw_int_in           (hw_int_in),
++    .has_int             (has_int),
++    .mem_wb_ex_bus        (mem_wb_ex_bus),
++    .clk                 (clk),
++    .mem_wb_csr_bus      (mem_wb_csr_bus),
++    .flush               (flush),
++    .flush_pc            (flush_pc),
+     .resetn              (resetn),
+     .mem_wb_valid        (mem_wb_valid),
+     .mem_wb_pc           (mem_wb_pc),
+diff --git "a/exp11\\myCPU/wb_stage.v" "b/exp13\\myCPU/wb_stage.v"
+index c3ba6d5..293f04e 100644
+--- "a/exp11\\myCPU/wb_stage.v"
++++ "b/exp13\\myCPU/wb_stage.v"
+@@ -1,8 +1,13 @@
+-// WB：组合选择写回结果，产生寄存器堆写端口和调试输出。
++`include "csr_defs.vh"
++
++// WB：选择写回结果，产生寄存器堆写端口并提交 CSR/异常状态。
+ // 输入已经来自 MEM/WB 寄存器，因此这里不再增加流水寄存器。
+-// WB 是组合写回逻辑，不需要 allow_in/ready_go 握手端口。
++// WB 固定每拍提交，无需 allow_in/ready_go；CSR 在本拍末的上升沿更新。
+ module wb_stage (
++    input  wire         clk,
+     input  wire         resetn,
++    input  wire [7:0]   hw_int_in,
++    output wire        has_int,
+ 
+     // 来自 MEM/WB 的结果与写回控制
+     input  wire         mem_wb_valid,
+@@ -15,6 +20,12 @@ module wb_stage (
+     input  wire [1:0]   mem_wb_addr_low,
+     input  wire         mem_wb_gr_we,
+     input  wire [4:0]   mem_wb_dest,
++    input  wire [83:0]  mem_wb_csr_bus,
++    input  wire [37:0]  mem_wb_ex_bus,
++
++    // 在 WB 统一处理精确异常及返回，冲刷所有更年轻的指令。
++    output wire         flush,
++    output wire [31:0]  flush_pc,
+ 
+     // 反馈给 ID 内部寄存器堆的写端口
+     output wire         rf_we,
+@@ -27,6 +38,53 @@ module wb_stage (
+     output wire [4:0]   debug_wb_rf_wnum,
+     output wire [31:0]  debug_wb_rf_wdata
+ );
++wire        csr_re;
++wire        csr_we;
++wire        ertn;
++wire        syscall;
++wire [13:0] csr_num;
++wire [31:0] csr_wmask;
++wire [31:0] csr_wdata;
++wire [31:0] csr_rdata;
++wire [31:0] ex_entry;
++wire [31:0] ex_era;
++wire [63:0] stable_counter;
++wire [5:0]  wb_ecode = mem_wb_ex_bus[37] ? `ECODE_INT :
++                       mem_wb_ex_bus[36] ? `ECODE_ADE :
++                       mem_wb_ex_bus[35] ? `ECODE_ALE :
++                       mem_wb_ex_bus[34] ? `ECODE_SYS :
++                       mem_wb_ex_bus[33] ? `ECODE_BRK : `ECODE_INE;
++wire [8:0]  wb_esubcode = 9'b0;
++wire        wb_ex = resetn && mem_wb_valid && (|mem_wb_ex_bus[37:32]);
++wire        ertn_flush = resetn && mem_wb_valid && ertn && !wb_ex;
++
++assign {csr_re, csr_we, ertn, syscall, csr_num, csr_wmask, csr_wdata} = mem_wb_csr_bus[81:0];
++assign flush = wb_ex || ertn_flush;
++assign flush_pc = wb_ex ? ex_entry : ex_era;
++
++// 读旧值、写新值和 GPR 写回发生在同一条指令的 WB 周期。
++// 下一条 CSR 指令在下一拍读到更新后的状态，不需要 CSR 专用前递。
++csr u_csr (
++    .clk        (clk),
++    .resetn     (resetn),
++    .hw_int_in  (hw_int_in),
++    .has_int    (has_int),
++    .stable_counter(stable_counter),
++    .csr_num    (csr_num),
++    .csr_rdata  (csr_rdata),
++    .csr_we     (resetn && mem_wb_valid && csr_we && !flush),
++    .csr_wmask  (csr_wmask),
++    .csr_wdata  (csr_wdata),
++    .wb_ex      (wb_ex),
++    .wb_pc      (mem_wb_pc),
++    .wb_ecode   (wb_ecode),
++    .wb_esubcode(wb_esubcode),
++    .wb_badv    (mem_wb_ex_bus[31:0]),
++    .ertn_flush (ertn_flush),
++    .ex_entry   (ex_entry),
++    .ex_era     (ex_era)
++);
++
+ // 同步 RAM 返回一个对齐的 32 位字，按原始地址低位取出 load 的有效部分。
+ wire [7:0] load_byte = (mem_wb_addr_low == 2'b00) ? mem_wb_mem_result[7:0] :
+                        (mem_wb_addr_low == 2'b01) ? mem_wb_mem_result[15:8] :
+@@ -44,9 +102,10 @@ wire [31:0] load_result = (mem_wb_mem_size == 2'b00) ?
+ 
+ // 写使能必须同时满足“指令有效”和“需要写通用寄存器”
+ // WB 写回同时作为 ID 的相关检测依据；r0 和复位不产生写回。
+-assign rf_we    = resetn && mem_wb_gr_we && mem_wb_valid && (mem_wb_dest != 5'd0);
++assign rf_we    = resetn && !flush && mem_wb_gr_we && mem_wb_valid && (mem_wb_dest != 5'd0);
+ assign rf_waddr = mem_wb_dest;
+-assign rf_wdata = mem_wb_res_from_mem ? load_result : mem_wb_alu_result;
++assign rf_wdata = csr_re ? csr_rdata :
++                 mem_wb_res_from_mem ? load_result : mem_wb_alu_result;
+ 
+ // 调试信号与实际寄存器堆写端口保持对应
+ assign debug_wb_pc       = mem_wb_pc;

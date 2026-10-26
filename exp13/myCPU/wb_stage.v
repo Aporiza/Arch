@@ -49,6 +49,8 @@ wire [31:0] csr_rdata;
 wire [31:0] ex_entry;
 wire [31:0] ex_era;
 wire [63:0] stable_counter;
+wire        rdcntvh = mem_wb_csr_bus[83];
+wire        rdcntvl = mem_wb_csr_bus[82];
 wire [5:0]  wb_ecode = mem_wb_ex_bus[37] ? `ECODE_INT :
                        mem_wb_ex_bus[36] ? `ECODE_ADE :
                        mem_wb_ex_bus[35] ? `ECODE_ALE :
@@ -104,7 +106,10 @@ wire [31:0] load_result = (mem_wb_mem_size == 2'b00) ?
 // WB 写回同时作为 ID 的相关检测依据；r0 和复位不产生写回。
 assign rf_we    = resetn && !flush && mem_wb_gr_we && mem_wb_valid && (mem_wb_dest != 5'd0);
 assign rf_waddr = mem_wb_dest;
-assign rf_wdata = csr_re ? csr_rdata :
+// rdcntvl/h 读取的是独立的 64 位稳定计数器，不能走普通 ALU 结果通路。
+assign rf_wdata = rdcntvh ? stable_counter[63:32] :
+                  rdcntvl ? stable_counter[31:0] :
+                  csr_re ? csr_rdata :
                  mem_wb_res_from_mem ? load_result : mem_wb_alu_result;
 
 // 调试信号与实际寄存器堆写端口保持对应
