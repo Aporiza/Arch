@@ -1,0 +1,738 @@
+diff --git a/exp13/myCPU/ex_stage.v b/exp14/myCPU/ex_stage.v
+index 9a2298b..aede8e1 100644
+--- a/exp13/myCPU/ex_stage.v
++++ b/exp14/myCPU/ex_stage.v
+@@ -1,10 +1,12 @@
+-// EX：选择 ALU 操作数并执行运算，保存 EX/MEM 流水寄存器。
++// EX：运算、地址对齐检查和类 SRAM 地址请求，保存 EX/MEM 流水寄存器。
+ // 存储数据、目的寄存器号和后续阶段控制位随指令一起传递。
+ module ex_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
+     input  wire         flush,
++    input  wire         mem_allow_in,  // MEM 入口槽能否更新
++    input  wire         mem_req_block, // 旧访存/异常/ertn 禁止年轻访存发请求
+ 
+     // 来自 ID/EX 的操作数与控制信号
+     input  wire         id_ex_valid,
+@@ -24,9 +26,18 @@ module ex_stage (
+     input  wire [83:0]  id_ex_csr_bus,
+     input  wire [37:0]  id_ex_ex_bus,
+ 
+-    // 除法未完成时阻止 ID/EX 接收下一条指令。
++    // 本级为空，或工作完成且 MEM 可接收时，才允许 ID 更新 ID/EX。
+     output wire         allow_in,
+ 
++    // 地址与写数据在 req && addr_ok 的上升沿一起被外部接收。
++    output wire         data_sram_req,
++    output wire         data_sram_wr,
++    output wire [1:0]   data_sram_size,
++    output wire [3:0]   data_sram_wstrb,
++    output wire [31:0]  data_sram_addr,
++    output wire [31:0]  data_sram_wdata,
++    input  wire         data_sram_addr_ok,
++
+     // 当前 EX 指令的相关信息反馈给 ID。
+     // 算术/逻辑结果可直接前递；load 和 CSR 结果需等待 WB。
+     output wire         ex_pending_we,
+@@ -54,18 +65,32 @@ wire [31:0]  alu_result;
+ wire         is_div = |id_ex_alu_op[18:15];
+ wire         div_complete;
+ reg          div_started;
++reg          div_done;
+ wire [31:0]  div_quotient;
+ wire [31:0]  div_remainder;
++wire         ex_exception;
++wire         addr_fire;
++wire         is_memory_access = id_ex_res_from_mem || id_ex_mem_we;
+ wire [31:0]  ex_result = is_div
+                        ? ((id_ex_alu_op[15] | id_ex_alu_op[17])
+                           ? div_quotient : div_remainder)
+                        : alu_result;
+ 
+-// complete 属于已启动的这条指令；不能让下一条除法消费旧完成标志。
+-assign allow_in = !id_ex_valid || !is_div || (div_started && div_complete);
++// complete 只有一拍；MEM 可能仍在等待响应，故必须锁存本条除法已完成。
++// 普通运算当拍就绪，除法等待结果，合法访存等待地址握手。
++// 异常访存不向 RAM 请求，直接把异常信息交给后级，避免永远等不到 addr_ok。
++wire div_ready = div_started && (div_done || div_complete);
++wire ready_go = (!is_div || div_ready) &&
++                (!is_memory_access || ex_exception || addr_fire);
++wire ex_to_mem_valid = id_ex_valid && ready_go;
++wire ex_fire = ex_to_mem_valid && mem_allow_in;
++// valid 表示当前 EX 槽中确有指令；ready_go 表示本条工作已经完成。
++// 只有两者和 mem_allow_in 同时为 1 才真正向 MEM 交接。
++// EX 为空则可以接收新指令，无需等待无效槽里的控制信号变为“就绪”。
++assign allow_in = !id_ex_valid || (ready_go && mem_allow_in);
+ assign ex_pending_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
+                          (id_ex_res_from_mem || (|id_ex_csr_bus[83:81]) ||
+-                          (is_div && !div_complete)) &&
++                          (is_div && !div_ready)) &&
+                          (id_ex_dest != 5'd0);
+ assign ex_pending_dest = id_ex_dest;
+ wire [31:0]  alu_src1 = id_ex_src1_is_pc ? id_ex_pc : id_ex_rj_value;
+@@ -74,7 +99,25 @@ wire [31:0]  alu_src2 = id_ex_src2_is_imm ? id_ex_imm : id_ex_rkd_value;
+ wire ale = (id_ex_res_from_mem || id_ex_mem_we) &&
+            (((id_ex_mem_size == 2'b10) && (|alu_result[1:0])) ||
+             ((id_ex_mem_size == 2'b01) && alu_result[0]));
+-wire ex_exception = (|id_ex_ex_bus[37:32]) || ale;
++assign ex_exception = (|id_ex_ex_bus[37:32]) || ale;
++
++// 最多一笔数据事务：仅在 MEM 能接收且没有旧事务/旧异常/ertn 时发请求。
++// 地址一旦握手就必定同时进入 MEM，因此不需要在 EX 另设已发送标志，
++// 也不会在下游堵塞时重复写 RAM。flush 当拍禁止一切新请求。
++assign data_sram_req = resetn && !flush && id_ex_valid &&
++                       is_memory_access && !ex_exception &&
++                       mem_allow_in && !mem_req_block;
++assign addr_fire = data_sram_req && data_sram_addr_ok;
++assign data_sram_wr = id_ex_mem_we;
++assign data_sram_size = id_ex_mem_size;
++assign data_sram_addr = alu_result;
++// size 和原始地址低位共同决定写入 lane，不能把字节/半字地址强行对齐。
++assign data_sram_wstrb = (id_ex_mem_size == 2'b00) ? (4'b0001 << alu_result[1:0]) :
++                         (id_ex_mem_size == 2'b01) ? (alu_result[1] ? 4'b1100 : 4'b0011) :
++                                                                  4'b1111;
++assign data_sram_wdata = (id_ex_mem_size == 2'b00) ? {4{id_ex_rkd_value[7:0]}} :
++                         (id_ex_mem_size == 2'b01) ? {2{id_ex_rkd_value[15:0]}} :
++                                                                   id_ex_rkd_value;
+ 
+ alu u_alu (
+     .alu_op     (id_ex_alu_op),
+@@ -97,17 +140,23 @@ divider u_divider (
+ );
+ 
+ always @(posedge clk) begin
+-    if (!resetn || flush)
++    if (!resetn || flush) begin
+         div_started <= 1'b0;
+-    else if (id_ex_valid && is_div && !div_started)
+-        div_started <= 1'b1;
+-    else if (allow_in)
++        div_done <= 1'b0;
++    end else if (ex_fire || !id_ex_valid) begin
+         div_started <= 1'b0;
++        div_done <= 1'b0;
++    end else begin
++        if (id_ex_valid && is_div && !div_started)
++            div_started <= 1'b1;
++        if (div_started && div_complete)
++            div_done <= 1'b1;
++    end
+ end
+ 
+ assign ex_forward_we   = resetn && !flush && id_ex_valid && id_ex_gr_we &&
+                          !id_ex_res_from_mem && !(|id_ex_csr_bus[83:81]) &&
+-                         !ex_exception && allow_in &&
++                         !ex_exception && ready_go &&
+                          (id_ex_dest != 5'd0);
+ assign ex_forward_dest = id_ex_dest;
+ assign ex_forward_data = ex_result;
+@@ -117,8 +166,9 @@ assign ex_forward_data = ex_result;
+ always @(posedge clk) begin
+     if (~resetn || flush)
+         ex_mem_valid <= 1'b0;
+-    else begin
+-        ex_mem_valid        <= id_ex_valid && allow_in;
++    else if (mem_allow_in) begin
++        // MEM 堵塞时保持整组 EX/MEM；EX 未完成时向空出的 MEM 注入气泡。
++        ex_mem_valid        <= ex_to_mem_valid;
+         ex_mem_pc           <= id_ex_pc;
+         ex_mem_alu_result   <= ex_result;
+         ex_mem_store_data   <= id_ex_rkd_value;
+diff --git a/exp13/myCPU/id_stage.v b/exp14/myCPU/id_stage.v
+index a654fcb..d833348 100644
+--- a/exp13/myCPU/id_stage.v
++++ b/exp14/myCPU/id_stage.v
+@@ -33,15 +33,14 @@ module id_stage (
+     input  wire         mem_forward_we,
+     input  wire [4:0]   mem_forward_dest,
+     input  wire [31:0]  mem_forward_data,
+-    // EX 除法未完成时保持 ID/EX，不能覆盖当前除法指令。
++    // EX 通过 allow_in 反馈接收能力；本级 ready_go 仅在模块内部使用。
+     input  wire         ex_allow_in,
+-    // 无数据相关、无冲刷且 EX 可以接收新指令时为 1。
+-    // 数据相关时冻结 IF 并向 EX 注入气泡；EX 忙时保持 ID/EX。
+-    output wire         ready_go,
++    output wire         id_allow_in,
+ 
+     // 反馈给 IF 的分支结果（组合逻辑）
+     output wire         br_taken,
+     output wire [31:0]  br_target,
++    output wire         br_stall,
+ 
+     // ID/EX 寄存器输出，供 EX 阶段使用
+     output reg          id_ex_valid,
+@@ -233,7 +232,7 @@ wire         src2_is_imm   = inst_slli_w | inst_srli_w | inst_srai_w |
+ // jirl/bl 使用 PC + 4 作为链接地址；lu12i.w 将立即数放入高 20 位
+ wire [31:0]  imm = (inst_jirl | inst_bl) ? 32'd4 :
+                     inst_lu12i_w          ? {i20, 12'b0} :
+-                    inst_pcaddu12i        ? {{12{i20[19]}}, i20, 12'b0} :
++                    inst_pcaddu12i        ? {i20, 12'b0} :
+                     (inst_andi | inst_ori | inst_xori) ? {20'b0, i12} :
+                                            {{20{i12[11]}}, i12};
+ 
+@@ -306,10 +305,17 @@ wire hazard_rj = use_rj && (rj != 5'd0) &&
+ wire hazard_rkd = use_rkd && (rf_raddr2 != 5'd0) &&
+                   ((ex_pending_we  && ex_pending_dest  == rf_raddr2) ||
+                    (mem_pending_we && mem_pending_dest == rf_raddr2));
+-// 较早的 CSR 写必须先提交，才能按新 PLV/IE/ECFG/ESTAT 判断异常。
+-// 异常指令无需等待普通操作数，但不能越过 EX 的较早指令。
+-assign ready_go = !flush && ex_allow_in && !csr_pending &&
++// ready_go 只描述译码工作是否完成；下一级是否有空间由 ex_allow_in 单独表示。
++// CSR 写提交前暂停判断中断；异常流水项无需等待无用的普通操作数。
++wire ready_go = !flush && !csr_pending &&
+                   !(resetn && if_id_valid && !id_exception && (hazard_rj || hazard_rkd));
++wire id_to_ex_valid = if_id_valid && ready_go;
++assign id_allow_in = !if_id_valid || (ready_go && ex_allow_in);
++// IF 为空时也可能继续取指，不能假设 ID 阻塞必然会阻塞整个前端。
++// 对尚未真正离开 ID 的分支暂停新请求，已有错误路径响应由 IF 重定向丢弃。
++assign br_stall = if_id_valid && !id_exception &&
++                  (is_cond_branch || inst_b || inst_bl || inst_jirl) &&
++                  !(ready_go && ex_allow_in);
+ 
+ // 寄存器堆：ID 提供读地址，WB 提供写使能、目的寄存器号和写回数据
+ regfile u_rf (
+@@ -330,7 +336,7 @@ assign br_taken = ((inst_beq & rj_eq_rd) |
+                    (inst_bge & ~rj_lt_rd) |
+                    (inst_bltu & rj_ltu_rd) |
+                    (inst_bgeu & ~rj_ltu_rd) |
+-                   inst_jirl | inst_bl | inst_b) & if_id_valid & ready_go & resetn & ~id_exception;
++                   inst_jirl | inst_bl | inst_b) & id_to_ex_valid & ex_allow_in & resetn & ~id_exception;
+ assign br_target = (is_cond_branch | inst_bl | inst_b)
+                  ? if_id_pc + br_offs
+                  : rj_value + jirl_offs;
+@@ -339,13 +345,10 @@ assign br_target = (is_cond_branch | inst_bl | inst_b)
+ always @(posedge clk) begin
+     if (reset || flush)
+         id_ex_valid <= 1'b0;
+-    else if (!ex_allow_in) begin
+-        // EX 正在执行多周期除法，保持本级流水寄存器。
+-    end else if (!ready_go)
+-        // 前端保持当前指令，后端继续前进；向 EX 注入一个无效槽。
+-        id_ex_valid <= 1'b0;
+-    else begin
+-        id_ex_valid        <= if_id_valid;
++    else if (ex_allow_in) begin
++        // EX 可接收时更新其入口槽。ID 未完成则注入气泡；EX 不可接收时
++        // 整组 ID/EX 寄存器保持，不能覆盖等待地址握手或执行除法的指令。
++        id_ex_valid        <= id_to_ex_valid;
+         id_ex_pc           <= if_id_pc;
+         id_ex_rj_value     <= rj_value;
+         id_ex_rkd_value    <= rkd_value;
+diff --git a/exp13/myCPU/if_stage.v b/exp14/myCPU/if_stage.v
+index f1f981a..20a2667 100644
+--- a/exp13/myCPU/if_stage.v
++++ b/exp14/myCPU/if_stage.v
+@@ -1,59 +1,115 @@
+-// IF：维护 PC，发出取指地址，并保存 IF/ID 流水寄存器。
+-// redirect_i 为 1 时使用 redirect_pc_i，并将顺序路径指令标记为无效。
++// IF：包含 pre-IF 地址请求控制、返回缓存和 IF/ID 流水寄存器。
++// pre-IF 是生成取指地址的逻辑部分，不额外增加一个流水级模块。
++// 每次最多一笔取指事务；ready_go 为模块内部信号，不作为级间端口。
+ module if_stage (
+-    // 时钟与低有效同步复位
+-    input  wire         clk,
+-    input  wire         resetn,
+-
+-    // 来自 ID 的取指重定向：是否跳转、目标地址
+-    input  wire         redirect_i,
+-    input  wire [31:0]  redirect_pc_i,
+-    // ID 无 load-use 相关时允许本阶段接收新指令；为 0 时保持 PC 和 IF/ID
+-    input  wire         allow_in,
+-
+-    // 指令 SRAM 接口
+-    input  wire [31:0]  inst_sram_rdata,
+-    output wire         inst_sram_en,
+-    output wire [3:0]   inst_sram_we,
+-    output wire [31:0]  inst_sram_addr,
+-    output wire [31:0]  inst_sram_wdata,
+-
+-    // IF/ID 寄存器输出，供 ID 阶段使用
+-    output reg          if_id_valid,
+-    output reg  [31:0]  if_id_pc,
+-    output reg  [31:0]  if_id_inst
++    input  wire        clk,
++    input  wire        resetn,
++    input  wire        id_allow_in,
++    input  wire        br_stall,
++    input  wire        redirect_i,
++    input  wire [31:0] redirect_pc_i,
++
++    // 地址阶段：只有 req && addr_ok 才表示这笔请求已被接收。
++    // 数据阶段：已接收请求至少下一拍才返回 data_ok，返回端没有反压。
++    output wire        inst_sram_req,
++    output wire        inst_sram_wr,
++    output wire [1:0]  inst_sram_size,
++    output wire [3:0]  inst_sram_wstrb,
++    output wire [31:0] inst_sram_addr,
++    output wire [31:0] inst_sram_wdata,
++    input  wire        inst_sram_addr_ok,
++    input  wire        inst_sram_data_ok,
++    input  wire [31:0] inst_sram_rdata,
++
++    output reg         if_id_valid,
++    output reg  [31:0] if_id_pc,
++    output reg  [31:0] if_id_inst
+ );
+-// PC 状态与取指启动有效位
+-reg  [31:0]  pc;
+-reg          valid;
+-wire         reset = ~resetn;
+-
+-// 顺序取指加 4；重定向时改用分支目标
+-wire [31:0]  next_pc = redirect_i ? redirect_pc_i : pc + 32'd4;
+-// ADEF 只针对未按 4 字节对齐的取指地址。非法地址不发起 SRAM 请求，
+-// 但仍把该 PC 作为异常流水项送入 ID，由 ID 产生精确异常标志。
+-wire         next_pc_adef = |next_pc[1:0];
+-
+-// 同步指令 RAM 使用 next_pc 发起读取；IF/ID 在时钟沿保存当前返回值
+-// ID 阻塞时同时冻结 RAM 输出和 PC，否则解除阻塞后指令与 PC 会错位。
+-assign inst_sram_en    = resetn && allow_in && !next_pc_adef;
+-assign inst_sram_we    = 4'b0;
++
++reg [31:0] next_pc;          // 尚未发起请求的下一条指令地址
++reg        fetch_pending;    // 地址已接收，仍欠一笔数据响应
++reg [31:0] fetch_pc;         // 与未完成请求绑定，不能随 next_pc 改变
++reg        discard_pending;  // 冲刷不能撤销外部请求，只能丢弃其返回
++reg        inst_buf_valid;
++reg [31:0] inst_buf;
++reg [31:0] inst_buf_pc;
++
++// 已预留一个返回缓存，因此 ID 堵塞也可以接收唯一未完成请求的响应。
++// 缓存占用或仍有未完成事务时不再请求，避免重复取指和覆盖返回数据。
++wire fetch_slot_free = !fetch_pending && !inst_buf_valid;
++wire fetch_adef = |next_pc[1:0];
++assign inst_sram_req   = resetn && !redirect_i && !br_stall &&
++                         fetch_slot_free && !fetch_adef;
++assign inst_sram_wr    = 1'b0;
++assign inst_sram_size  = 2'b10;  // 每条指令固定为 4 字节
++assign inst_sram_wstrb = 4'b0;
+ assign inst_sram_addr  = next_pc;
+ assign inst_sram_wdata = 32'b0;
+ 
+-// PC 和 IF/ID 更新：复位后先建立取指有效位；跳转时向 ID 插入气泡。
+-// 数据寄存器无需随气泡清零，后续阶段通过 valid 屏蔽其副作用。
++wire addr_fire = inst_sram_req && inst_sram_addr_ok;
++wire response = fetch_pending && inst_sram_data_ok;
++// ADEF 不向 RAM 发请求；合成一个携带错误 PC 的流水项，由 ID 标记异常。
++// 指令码置零，ADEF 优先于因此产生的 INE，最终 BADV/ERA 都能保存错误 PC。
++wire local_adef = resetn && !redirect_i && !br_stall &&
++                  fetch_slot_free && fetch_adef;
++wire return_valid = (response && !discard_pending) || local_adef;
++wire [31:0] return_pc = local_adef ? next_pc : fetch_pc;
++wire [31:0] return_inst = local_adef ? 32'b0 : inst_sram_rdata;
++// ready_go 仅说明“已有可交给 ID 的指令”；还需 id_allow_in 才能交接。
++// IF/ID 是 ID 当前使用的入口槽，因此 ID 阻塞时不能改写它。
++wire ready_go = inst_buf_valid || return_valid;
++wire if_to_id_valid = ready_go && !redirect_i;
++
++// 总线事务记账独立于流水线有效位。重定向目标直接锁存在 next_pc 中；
++// 即使旧请求还没返回，也不会丢失一拍的分支/异常重定向。
++always @(posedge clk) begin
++    if (!resetn) begin
++        next_pc <= 32'h1c00_0000;
++        fetch_pending <= 1'b0;
++        fetch_pc <= 32'b0;
++        discard_pending <= 1'b0;
++    end else begin
++        if (response) begin
++            fetch_pending <= 1'b0;
++            discard_pending <= 1'b0;
++        end
++        if (addr_fire) begin
++            fetch_pending <= 1'b1;
++            fetch_pc <= next_pc;
++            next_pc <= next_pc + 32'd4;
++        end else if (local_adef)
++            next_pc <= next_pc + 32'd4;
++
++        // 重定向优先。若旧数据同拍返回，直接丢弃，不必继续等待。
++        if (redirect_i) begin
++            next_pc <= redirect_pc_i;
++            if (fetch_pending && !response)
++                discard_pending <= 1'b1;
++        end
++    end
++end
++
++// data_ok 没有反压：返回当拍若 ID 无法接收，必须保存指令和对应 PC。
++// 先消费缓存，再允许下次请求，故不会发生缓存被第二个响应覆盖。
+ always @(posedge clk) begin
+-    if (reset) begin
+-        valid       <= 1'b0;
+-        pc          <= 32'h1bfffffc;
++    if (!resetn || redirect_i) begin
++        inst_buf_valid <= 1'b0;
+         if_id_valid <= 1'b0;
+-    end else if (allow_in) begin
+-        valid       <= 1'b1;
+-        pc          <= next_pc;
+-        if_id_valid <= valid && !redirect_i;
+-        if_id_pc    <= pc;
+-        if_id_inst  <= inst_sram_rdata;
++    end else begin
++        if (id_allow_in) begin
++            if_id_valid <= if_to_id_valid;
++            if (if_to_id_valid) begin
++                if_id_pc <= inst_buf_valid ? inst_buf_pc : return_pc;
++                if_id_inst <= inst_buf_valid ? inst_buf : return_inst;
++            end
++        end
++        if (inst_buf_valid && id_allow_in)
++            inst_buf_valid <= 1'b0;
++        if (return_valid && !id_allow_in) begin
++            inst_buf_valid <= 1'b1;
++            inst_buf_pc <= return_pc;
++            inst_buf <= return_inst;
++        end
+     end
+ end
+ 
+diff --git a/exp13/myCPU/mem_stage.v b/exp14/myCPU/mem_stage.v
+index 9054a02..6ae3fbf 100644
+--- a/exp13/myCPU/mem_stage.v
++++ b/exp14/myCPU/mem_stage.v
+@@ -1,11 +1,12 @@
+-// MEM：产生数据 SRAM 访问控制，保存 MEM/WB 流水寄存器。
+-// 同步 RAM 在 MEM/WB 更新的同一上升沿返回数据，返回线直接交给 WB。
+-// MEM 固定每拍接收 EX/MEM 内容，不需要额外的 allow_in/ready_go 握手端口。
++// MEM：接收 EX 已完成地址握手的事务，等待数据响应，保存 MEM/WB。
++// load 和 store 都必须等 data_ok；否则下一条 load 会错认 store 的响应。
+ module mem_stage (
+     // 时钟与低有效同步复位
+     input  wire         clk,
+     input  wire         resetn,
+     input  wire         flush,
++    output wire         allow_in,
++    output wire         mem_req_block,
+ 
+     // 来自 EX/MEM 的地址、存储数据和控制信号
+     input  wire         ex_mem_valid,
+@@ -31,19 +32,15 @@ module mem_stage (
+     output wire [4:0]   mem_forward_dest,
+     output wire [31:0]  mem_forward_data,
+ 
+-    // 数据 SRAM 接口
++    // 数据响应没有 ready 反压；WB 固定可接收，在返回当拍锁存读数据。
+     input  wire [31:0]  data_sram_rdata,
+-    output wire         data_sram_en,
+-    output wire [3:0]   data_sram_we,
+-    output wire [31:0]  data_sram_addr,
+-    output wire [31:0]  data_sram_wdata,
+-    
++    input  wire         data_sram_data_ok,
+ 
+     // MEM/WB 寄存器输出，供 WB 阶段使用
+     output reg          mem_wb_valid,
+     output reg  [31:0]  mem_wb_pc,
+     output reg  [31:0]  mem_wb_alu_result,
+-    output wire [31:0]  mem_wb_mem_result,
++    output reg  [31:0]  mem_wb_mem_result,
+     output reg          mem_wb_res_from_mem,
+     output reg  [1:0]   mem_wb_mem_size,
+     output reg          mem_wb_load_unsigned,
+@@ -53,6 +50,19 @@ module mem_stage (
+     output reg  [83:0]  mem_wb_csr_bus,
+     output reg  [37:0]  mem_wb_ex_bus
+ );
++wire is_memory_access = ex_mem_res_from_mem || ex_mem_mem_we;
++// EX 已经完成地址握手；MEM 不能把“地址已接受”误当成“访存已结束”。
++// 非访存（包括已屏蔽访存控制的异常项）无需等待外部响应。
++wire ready_go = !is_memory_access || data_sram_data_ok;
++wire mem_to_wb_valid = ex_mem_valid && ready_go;
++assign allow_in = !ex_mem_valid || ready_go;  // WB 总能接收，不会阻塞 MEM。
++
++// 精确异常保护：老异常/ertn 尚在 MEM 时，年轻 store 不得提前写内存。
++// 对 load 采用同样的保守限制，保证数据事务不会被更老的异常取消。
++// 旧访存仍占用 MEM 时也不接受新请求，数据端最多一笔未完成事务。
++assign mem_req_block = ex_mem_valid &&
++                       (is_memory_access || (|ex_mem_ex_bus[37:32]) ||
++                        ex_mem_csr_bus[79]);
+ // load 和 CSR 结果都在 WB 可用；不能把它们的 ALU 结果误当前递数据。
+ assign mem_pending_we   = resetn && !flush && ex_mem_valid && ex_mem_gr_we &&
+                           (ex_mem_res_from_mem || (|ex_mem_csr_bus[83:81])) &&
+@@ -62,35 +72,21 @@ assign mem_pending_dest = ex_mem_dest;
+ // 当前指令位于 MEM 阶段时，普通运算指令的 ALU 结果已经稳定，
+ // 可以绕过寄存器堆，直接送回 ID 阶段解决数据相关。
+ assign mem_forward_we   = resetn && !flush && ex_mem_valid && ex_mem_gr_we &&
++                          ready_go &&
+                           !ex_mem_res_from_mem && !(|ex_mem_csr_bus[83:81]) &&
+                           (ex_mem_dest != 5'd0);
+ assign mem_forward_dest = ex_mem_dest;
+ assign mem_forward_data = ex_mem_alu_result;
+ 
+-// WB 异常/ertn 冲刷时，MEM 指令比它年轻，必须在本拍就取消访存。
+-assign data_sram_en    = resetn && !flush && ex_mem_valid && (ex_mem_mem_we || ex_mem_res_from_mem);
+-// RAM 是 32 位、4 路字节写使能。字节/半字存储只打开对应 lane，
+-// 写数据在相应 lane 复制，兼容 BRAM 和外设桥的 byte-enable 语义。
+-assign data_sram_we = !resetn || flush || !ex_mem_valid || !ex_mem_mem_we ? 4'b0000 :
+-                      (ex_mem_mem_size == 2'b00) ? (4'b0001 << ex_mem_alu_result[1:0]) :
+-                      (ex_mem_mem_size == 2'b01) ? (ex_mem_alu_result[1] ? 4'b1100 : 4'b0011) :
+-                                                   4'b1111;
+-assign data_sram_addr  = ex_mem_alu_result;
+-assign data_sram_wdata = (ex_mem_mem_size == 2'b00) ? {4{ex_mem_store_data[7:0]}} :
+-                         (ex_mem_mem_size == 2'b01) ? {2{ex_mem_store_data[15:0]}} :
+-                                                       ex_mem_store_data;
+-
+-// 不在这里再次采样 rdata：非阻塞赋值会采到上一笔请求的数据。
+-// RAM/bridge 内部的返回寄存器已经提供这一拍，与 mem_wb_* 对齐。
+-assign mem_wb_mem_result = data_sram_rdata;
+-
+ // MEM/WB：传递 ALU 结果及对应的写回控制。
+ // 复位清除有效位，WB 通过该有效位禁止无效指令写寄存器。
+ always @(posedge clk) begin
+     if (~resetn || flush)
+         mem_wb_valid <= 1'b0;
+     else begin
+-        mem_wb_valid        <= ex_mem_valid;
++        // 每拍重新产生 WB 有效位；MEM 等待时 WB 是气泡，不能重复提交旧指令。
++        mem_wb_valid        <= mem_to_wb_valid;
++        mem_wb_mem_result   <= data_sram_rdata;
+         mem_wb_pc           <= ex_mem_pc;
+         mem_wb_alu_result   <= ex_mem_alu_result;
+         mem_wb_res_from_mem <= ex_mem_res_from_mem;
+diff --git a/exp13/myCPU/mycpu_top.v b/exp14/myCPU/mycpu_top.v
+index 9b2d006..4a871a7 100644
+--- a/exp13/myCPU/mycpu_top.v
++++ b/exp14/myCPU/mycpu_top.v
+@@ -8,16 +8,26 @@ module mycpu_top (
+     // 八路高电平有效硬件中断；无外部中断源的 SoC 应连接 8'b0。
+     input  wire [7:0]   hw_int_in,
+ 
+-    // 指令 SRAM 接口
+-    output wire         inst_sram_en,
+-    output wire [3:0]   inst_sram_we,
++    // 类 SRAM 指令接口：req && addr_ok 接受请求，data_ok 标识该请求完成。
++    // size：00/01/10 分别为字节/半字/字；wstrb 每位控制一个字节。
++    output wire         inst_sram_req,
++    output wire         inst_sram_wr,
++    output wire [1:0]   inst_sram_size,
++    output wire [3:0]   inst_sram_wstrb,
++    input  wire         inst_sram_addr_ok,
++    input  wire         inst_sram_data_ok,
+     output wire [31:0]  inst_sram_addr,
+     output wire [31:0]  inst_sram_wdata,
+     input  wire [31:0]  inst_sram_rdata,
+ 
+-    // 数据 SRAM 接口
+-    output wire         data_sram_en,
+-    output wire [3:0]   data_sram_we,
++    // 类 SRAM 数据接口：EX 发请求，MEM 等待 load/store 的完成响应。
++    // 数据端一次只挂起一笔事务，store 也必须收到 data_ok 才离开 MEM。
++    output wire         data_sram_req,
++    output wire         data_sram_wr,
++    output wire [1:0]   data_sram_size,
++    output wire [3:0]   data_sram_wstrb,
++    input  wire         data_sram_addr_ok,
++    input  wire         data_sram_data_ok,
+     output wire [31:0]  data_sram_addr,
+     output wire [31:0]  data_sram_wdata,
+     input  wire [31:0]  data_sram_rdata,
+@@ -31,7 +41,11 @@ module mycpu_top (
+ 
+ // ID → IF：分支反馈和前端冻结控制。
+ // EX 的多周期除法通过 allow_in 冻结 ID/IF。
+-wire         ready_go;
++// ready_go 仅用于各模块内部；顶层传递接收能力与有效位。
++wire         id_allow_in;
++wire         mem_allow_in;
++wire         mem_req_block;
++wire         br_stall;
+ wire         ex_allow_in;
+ wire         ex_pending_we;
+ wire [4:0]   ex_pending_dest;
+@@ -115,74 +129,89 @@ wire [31:0]  flush_pc;
+ 
+ // IF：PC、取指和 IF/ID 寄存器
+ if_stage u_if (
+-    // 异常/返回必须越过 load-use 或除法造成的前端冻结。
+-    .allow_in        (ready_go || flush),
+-    .clk             (clk),
+-    .resetn          (resetn),
+-    .redirect_i      (flush || br_taken),
+-    .redirect_pc_i   (flush ? flush_pc : br_target),
+-    .inst_sram_rdata (inst_sram_rdata),
+-    .inst_sram_en    (inst_sram_en),
+-    .inst_sram_we    (inst_sram_we),
+-    .inst_sram_addr  (inst_sram_addr),
+-    .inst_sram_wdata (inst_sram_wdata),
+-    .if_id_valid     (if_id_valid),
+-    .if_id_pc        (if_id_pc),
+-    .if_id_inst      (if_id_inst)
++    // IF 内部锁存重定向并排空旧响应，异常优先于普通分支。
++    .id_allow_in         (id_allow_in),
++    .br_stall            (br_stall),
++    .clk                 (clk),
++    .resetn              (resetn),
++    .redirect_i          (flush || br_taken),
++    .redirect_pc_i       (flush ? flush_pc : br_target),
++    .inst_sram_rdata     (inst_sram_rdata),
++    .inst_sram_req       (inst_sram_req),
++    .inst_sram_wr        (inst_sram_wr),
++    .inst_sram_size      (inst_sram_size),
++    .inst_sram_wstrb     (inst_sram_wstrb),
++    .inst_sram_addr_ok   (inst_sram_addr_ok),
++    .inst_sram_data_ok   (inst_sram_data_ok),
++    .inst_sram_addr      (inst_sram_addr),
++    .inst_sram_wdata     (inst_sram_wdata),
++    .if_id_valid         (if_id_valid),
++    .if_id_pc            (if_id_pc),
++    .if_id_inst          (if_id_inst)
+ );
+ 
+ // ID：译码、寄存器堆、分支判断和 ID/EX 寄存器
+ id_stage u_id (
+-    .has_int           (has_int),
+-    .csr_pending       (csr_pending),
+-    .id_ex_ex_bus      (id_ex_ex_bus),
+-    .flush             (flush),
+-    .id_ex_csr_bus     (id_ex_csr_bus),
+-    .ex_pending_we      (ex_pending_we),
+-    .ex_pending_dest    (ex_pending_dest),
+-    .mem_pending_we     (mem_pending_we),
+-    .mem_pending_dest   (mem_pending_dest),
+-    .ex_forward_we      (ex_forward_we),
+-    .ex_forward_dest    (ex_forward_dest),
+-    .ex_forward_data    (ex_forward_data),
+-    .mem_forward_we     (mem_forward_we),
+-    .mem_forward_dest   (mem_forward_dest),
+-    .mem_forward_data   (mem_forward_data),
+-    .ex_allow_in        (ex_allow_in),
+-    .ready_go           (ready_go),
+-    .clk                (clk),
+-    .resetn             (resetn),
+-    .if_id_valid        (if_id_valid),
+-    .if_id_pc           (if_id_pc),
+-    .if_id_inst         (if_id_inst),
+-    .rf_we              (rf_we),
+-    .rf_waddr           (rf_waddr),
+-    .rf_wdata           (rf_wdata),
+-    .br_taken           (br_taken),
+-    .br_target          (br_target),
+-    .id_ex_valid        (id_ex_valid),
+-    .id_ex_pc           (id_ex_pc),
+-    .id_ex_rj_value     (id_ex_rj_value),
+-    .id_ex_rkd_value    (id_ex_rkd_value),
+-    .id_ex_imm          (id_ex_imm),
+-    .id_ex_alu_op       (id_ex_alu_op),
+-    .id_ex_src1_is_pc   (id_ex_src1_is_pc),
+-    .id_ex_src2_is_imm  (id_ex_src2_is_imm),
+-    .id_ex_res_from_mem (id_ex_res_from_mem),
+-    .id_ex_mem_we       (id_ex_mem_we),
+-    .id_ex_mem_size     (id_ex_mem_size),
+-    .id_ex_load_unsigned(id_ex_load_unsigned),
+-    .id_ex_gr_we        (id_ex_gr_we),
+-    .id_ex_dest         (id_ex_dest)
++    .has_int             (has_int),
++    .csr_pending         (csr_pending),
++    .id_ex_ex_bus        (id_ex_ex_bus),
++    .flush               (flush),
++    .id_ex_csr_bus       (id_ex_csr_bus),
++    .ex_pending_we       (ex_pending_we),
++    .ex_pending_dest     (ex_pending_dest),
++    .mem_pending_we      (mem_pending_we),
++    .mem_pending_dest    (mem_pending_dest),
++    .ex_forward_we       (ex_forward_we),
++    .ex_forward_dest     (ex_forward_dest),
++    .ex_forward_data     (ex_forward_data),
++    .mem_forward_we      (mem_forward_we),
++    .mem_forward_dest    (mem_forward_dest),
++    .mem_forward_data    (mem_forward_data),
++    .ex_allow_in         (ex_allow_in),
++    .id_allow_in         (id_allow_in),
++    .br_stall            (br_stall),
++    .clk                 (clk),
++    .resetn              (resetn),
++    .if_id_valid         (if_id_valid),
++    .if_id_pc            (if_id_pc),
++    .if_id_inst          (if_id_inst),
++    .rf_we               (rf_we),
++    .rf_waddr            (rf_waddr),
++    .rf_wdata            (rf_wdata),
++    .br_taken            (br_taken),
++    .br_target           (br_target),
++    .id_ex_valid         (id_ex_valid),
++    .id_ex_pc            (id_ex_pc),
++    .id_ex_rj_value      (id_ex_rj_value),
++    .id_ex_rkd_value     (id_ex_rkd_value),
++    .id_ex_imm           (id_ex_imm),
++    .id_ex_alu_op        (id_ex_alu_op),
++    .id_ex_src1_is_pc    (id_ex_src1_is_pc),
++    .id_ex_src2_is_imm   (id_ex_src2_is_imm),
++    .id_ex_res_from_mem  (id_ex_res_from_mem),
++    .id_ex_mem_we        (id_ex_mem_we),
++    .id_ex_mem_size      (id_ex_mem_size),
++    .id_ex_load_unsigned (id_ex_load_unsigned),
++    .id_ex_gr_we         (id_ex_gr_we),
++    .id_ex_dest          (id_ex_dest)
+ );
+ 
+-// EX：ALU 和 EX/MEM 寄存器
++// EX：ALU、数据地址请求和 EX/MEM 寄存器
+ ex_stage u_ex (
+-    .id_ex_ex_bus       (id_ex_ex_bus),
+-    .ex_mem_ex_bus      (ex_mem_ex_bus),
+-    .flush              (flush),
+-    .id_ex_csr_bus      (id_ex_csr_bus),
+-    .ex_mem_csr_bus     (ex_mem_csr_bus),
++    .mem_allow_in        (mem_allow_in),
++    .mem_req_block       (mem_req_block),
++    .data_sram_req       (data_sram_req),
++    .data_sram_wr        (data_sram_wr),
++    .data_sram_size      (data_sram_size),
++    .data_sram_wstrb     (data_sram_wstrb),
++    .data_sram_addr      (data_sram_addr),
++    .data_sram_wdata     (data_sram_wdata),
++    .data_sram_addr_ok   (data_sram_addr_ok),
++    .id_ex_ex_bus        (id_ex_ex_bus),
++    .ex_mem_ex_bus       (ex_mem_ex_bus),
++    .flush               (flush),
++    .id_ex_csr_bus       (id_ex_csr_bus),
++    .ex_mem_csr_bus      (ex_mem_csr_bus),
+     .allow_in            (ex_allow_in),
+     .ex_pending_we       (ex_pending_we),
+     .ex_pending_dest     (ex_pending_dest),
+@@ -217,13 +246,16 @@ ex_stage u_ex (
+     .ex_mem_dest         (ex_mem_dest)
+ );
+ 
+-// MEM：数据 SRAM 接口和 MEM/WB 寄存器
++// MEM：数据响应接收和 MEM/WB 寄存器
+ mem_stage u_mem (
+-    .ex_mem_ex_bus      (ex_mem_ex_bus),
+-    .mem_wb_ex_bus      (mem_wb_ex_bus),
+-    .flush              (flush),
+-    .ex_mem_csr_bus     (ex_mem_csr_bus),
+-    .mem_wb_csr_bus     (mem_wb_csr_bus),
++    .allow_in            (mem_allow_in),
++    .mem_req_block       (mem_req_block),
++    .data_sram_data_ok   (data_sram_data_ok),
++    .ex_mem_ex_bus       (ex_mem_ex_bus),
++    .mem_wb_ex_bus       (mem_wb_ex_bus),
++    .flush               (flush),
++    .ex_mem_csr_bus      (ex_mem_csr_bus),
++    .mem_wb_csr_bus      (mem_wb_csr_bus),
+     .mem_pending_we      (mem_pending_we),
+     .mem_pending_dest    (mem_pending_dest),
+     .mem_forward_we      (mem_forward_we),
+@@ -242,10 +274,6 @@ mem_stage u_mem (
+     .ex_mem_gr_we        (ex_mem_gr_we),
+     .ex_mem_dest         (ex_mem_dest),
+     .data_sram_rdata     (data_sram_rdata),
+-    .data_sram_en        (data_sram_en),
+-    .data_sram_we        (data_sram_we),
+-    .data_sram_addr      (data_sram_addr),
+-    .data_sram_wdata     (data_sram_wdata),
+     .mem_wb_valid        (mem_wb_valid),
+     .mem_wb_pc           (mem_wb_pc),
+     .mem_wb_alu_result   (mem_wb_alu_result),
+@@ -262,7 +290,7 @@ mem_stage u_mem (
+ wb_stage u_wb (
+     .hw_int_in           (hw_int_in),
+     .has_int             (has_int),
+-    .mem_wb_ex_bus        (mem_wb_ex_bus),
++    .mem_wb_ex_bus       (mem_wb_ex_bus),
+     .clk                 (clk),
+     .mem_wb_csr_bus      (mem_wb_csr_bus),
+     .flush               (flush),
